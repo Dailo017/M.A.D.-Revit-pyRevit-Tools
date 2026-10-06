@@ -48,13 +48,8 @@ Then click **pyRevit ▸ Reload** (or restart Revit).
 | **MEP Network** | Creates a network of ducts or pipes from detail/model lines: places placeholders, connects them at shared points (elbow, tee, cross) and converts them into real ducts / pipes. |
 | **Pipe Orientation** | Classifies each pipe as vertical, horizontal or sloped and writes the result in the chosen parameter. |
 | **Reference Level** | Changes the reference level of the selected MEP elements **without moving them** (the offset is recalculated). |
-<<<<<<< Updated upstream
-| **TagHVAC** | Tags every vertical pipe and duct in the active view, grouped by system type, with a tag type chosen per system. Tags are offset 100 cm with a leader, and overlapping tag heads are pushed apart automatically. |
-| **TagPLBG** | Same as above, but tags are placed centered on the element, without a leader. |
-=======
-| **TagHVAC** | Tags every vertical pipe and duct in the active 2D view (10° tolerance), grouped by system type, with a tag type chosen per system in a scrollable, resizable form. Tags are offset 100 cm with a leader; overlapping tag heads are pushed apart automatically (without rotating them). All tags are created in a single transaction (one Undo). |
-| **TagPLBG** | Same as TagHVAC, but tags are placed centered on the element's midpoint, without a leader. |
->>>>>>> Stashed changes
+| **TagHVAC** | Tags every vertical pipe and duct in the active 2D view (10° tolerance), grouped by system type, with a tag type chosen per system in a scrollable, resizable form. Already-tagged elements can be skipped. Tags are offset 100 cm with a leader; overlapping tag heads are pushed apart automatically (without rotating them). All tags are created in a single transaction (one Undo). |
+| **TagPLBG** | Same detection, form and single transaction as TagHVAC, but tags are placed centered on the element's midpoint, without a leader and without overlap resolution. |
 
 ### STR – Structure
 
