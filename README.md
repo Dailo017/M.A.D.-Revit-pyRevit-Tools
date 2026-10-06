@@ -51,10 +51,9 @@ Then click **pyRevit ▸ Reload** (or restart Revit).
 <<<<<<< Updated upstream
 | **TagHVAC** | Tags every vertical pipe and duct in the active view, grouped by system type, with a tag type chosen per system. Tags are offset 100 cm with a leader, and overlapping tag heads are pushed apart automatically. |
 | **TagPLBG** | Same as above, but tags are placed centered on the element, without a leader. |
-=======
 | **TagHVAC** | Tags every vertical pipe and duct in the active 2D view (10° tolerance), grouped by system type, with a tag type chosen per system in a scrollable, resizable form. Tags are offset 100 cm with a leader; overlapping tag heads are pushed apart automatically (without rotating them). All tags are created in a single transaction (one Undo). |
 | **TagPLBG** | Same as TagHVAC, but tags are placed centered on the element's midpoint, without a leader. |
->>>>>>> Stashed changes
+
 
 ### STR – Structure
 
