@@ -48,8 +48,8 @@ Then click **pyRevit ▸ Reload** (or restart Revit).
 | **MEP Network** | Creates a network of ducts or pipes from detail/model lines: places placeholders, connects them at shared points (elbow, tee, cross) and converts them into real ducts / pipes. |
 | **Pipe Orientation** | Classifies each pipe as vertical, horizontal or sloped and writes the result in the chosen parameter. |
 | **Reference Level** | Changes the reference level of the selected MEP elements **without moving them** (the offset is recalculated). |
-| **TagHVAC** | Tags every vertical pipe and duct in the active 2D view (10° tolerance), grouped by system type, with a tag type chosen per system in a scrollable, resizable form. Already-tagged elements can be skipped. Tags are offset 100 cm with a leader; overlapping tag heads are pushed apart automatically (without rotating them). All tags are created in a single transaction (one Undo). |
-| **TagPLBG** | Same detection, form and single transaction as TagHVAC, but tags are placed centered on the element's midpoint, without a leader and without overlap resolution. |
+| **TagHVAC** | Tags every vertical pipe and duct in the active 2D view (10° tolerance), grouped by system type, with a tag type (`Family : Type`) chosen per system in a scrollable, resizable form that remembers the last choice. Segments seen on the same vertical (e.g. a riser split per floor) get a single tag. Tags have a leader and are laid out in aligned columns per zone, with leaders that do not cross; columns avoid MEP networks (pipes, ducts, cable trays, conduits, using their real path), existing tags and the tagged elements, moving at most 25 mm on paper. Distances are in paper mm, so the result is the same at any scale. Already-tagged verticals can be skipped. All tags are created in a single transaction (one Undo). |
+| **TagPLBG** | Same vertical detection and form as TagHVAC (one tag per element), but tags are placed centered on the element's midpoint, without a leader and without overlap resolution. |
 
 ### STR – Structure
 
@@ -61,7 +61,7 @@ Then click **pyRevit ▸ Reload** (or restart Revit).
 | **RSV NGF** | Calculates the NGF elevation of the bottom of the selected reservations: `level elevation + offset − (RSV_H or RSV_D) / 2`. |
 | **Select Thick Walls** | Selects every wall in the project thicker than 35 cm. |
 | **Split Walls** | Splits each selected wall into one wall per layer of its compound structure, creating a wall type per layer named `<Material> (<width>cm)`. |
-| **Sync Doors Windows** | Synchronizes the doors and windows of a linked ARC model into the active STR model: maps each ARC family to an STR family, creates missing types, hosts them in the nearest wall, and updates/deletes previously synced elements (tracked by UniqueId in *Comments*). |
+| **Sync Doors Windows** | Synchronizes the doors and windows of a linked ARC model into the active STR model using **one door family and one window family** of the active model: creates (or reuses) a type for each width × height found (nominal or rough-opening dimensions), places each element in the matching wall (same position, bottom elevation and facing/hand orientation), updates previously synced elements and deletes those whose source no longer exists. STR doors/windows overlapping an ARC opening are replaced; decorative ARC openings that do not cut through their wall are ignored. Synced elements are tracked with Extensible Storage (*Comments* stays free; v1.0 elements are migrated automatically). |
 | **Walls From Lines** | Creates walls from pairs of parallel model lines (e.g. both faces of a wall in a CAD plan): finds the pairs, draws a center line and creates a wall of the chosen type on it. |
 
 > Each button's tooltip in Revit shows the full description, how-to steps and changelog.
