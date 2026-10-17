@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__   = "TagPLBG"
-__doc__     = """Version = 1.3
+__doc__     = """Version = 1.4
 Date    = 17.10.2026
 ________________________________________________________________
 Description:
@@ -34,10 +34,12 @@ How-To:
 
 - Abre una vista 2D (planta, seccion o alzado).
 - Pulsa el boton: aparecera un grupo por cada sistema vertical detectado.
-- Marca los grupos que quieras etiquetar y elige su tipo de etiqueta.
+- Marca los grupos que quieras etiquetar y elige su tipo de etiqueta,
+  o "— No tag —" para no colocar etiquetas en ese sistema.
 - Aceptar -> crea todas las etiquetas en UNA sola transaccion (un solo Undo).
 ________________________________________________________________
 Last Updates:
+- [17.10.2026] v1.4 "No tag" option per system in the form
 - [17.10.2026] v1.3 Rotation chosen from the visible tag geometry
                (arrow, symbols, text) so tags do not cross
 - [17.10.2026] v1.2 One tag per vertical and system; overlapping tags
@@ -90,6 +92,7 @@ ZONA_LIBRE_MM         = 1.5   # Radio junto a la cabeza donde se permite cruce
 ANCHO_CARACTER        = 0.8   # Ancho medio de caracter / altura de texto
 MM_POR_PIE            = 304.8
 TITULO_FORM      = u'Etiquetar Verticales'
+NO_ETIQUETAR     = u'— No tag —'   # Opcion del desplegable de sistema
 
 ANCHO_VENTANA       = 540.0
 ALTO_MIN_VENTANA    = 340.0
@@ -519,6 +522,20 @@ def calcular_alto_ventana(grupos):
     return max(ALTO_MIN_VENTANA, min(alto_contenido, alto_maximo)), alto_maximo
 
 
+def enlazar_no_etiquetar(chk, combo):
+    """Sincroniza la casilla y el desplegable: elegir "No etiquetar"
+    desmarca la casilla; volver a marcarla elige el primer tipo."""
+    def _on_combo(sender, args):
+        if combo.SelectedItem == NO_ETIQUETAR:
+            chk.IsChecked = False
+
+    def _on_check(sender, args):
+        if combo.SelectedItem == NO_ETIQUETAR:
+            combo.SelectedIndex = 1
+    combo.SelectionChanged += _on_combo
+    chk.Checked += _on_check
+
+
 def crear_ventana_formulario(grupos, tipos_por_kind, vista_nombre):
     """Construye el formulario WPF: cabecera y boton fijos, lista de
     sistemas con scroll vertical si no caben en pantalla.
@@ -632,9 +649,12 @@ def crear_ventana_formulario(grupos, tipos_por_kind, vista_nombre):
             combo.Margin = Thickness(22, 0, 0, 0)
             combo.MinWidth = 280.0
             combo.HorizontalAlignment = HorizontalAlignment.Left
+            combo.Items.Add(NO_ETIQUETAR)
             for nombre in sorted(tipos.keys()):
                 combo.Items.Add(nombre)
-            combo.SelectedIndex = 0
+            combo.SelectedIndex = 1   # primer tipo de etiqueta real
+
+            enlazar_no_etiquetar(chk, combo)
 
             fila_panel.Children.Add(chk)
             fila_panel.Children.Add(combo)
@@ -721,7 +741,7 @@ for fila in filas:
     if not fila['checkbox'].IsChecked:
         continue
     nombre_sel = fila['combo'].SelectedItem
-    if not nombre_sel:
+    if not nombre_sel or nombre_sel == NO_ETIQUETAR:
         continue
     simbolo = fila['tipos'].get(nombre_sel)
     if simbolo is None:
