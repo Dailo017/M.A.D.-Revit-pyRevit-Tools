@@ -1,35 +1,41 @@
 # -*- coding: utf-8 -*-
 __title__   = "Split\nWalls"
-__doc__     = """Version = 2.3
+__doc__     = """Version = 2.4
 Date    = 17.10.2026
 ________________________________________________________________
 Description:
 
-Splits each selected wall into one independent wall per layer.
+Splits each selected wall into one independent wall per layer
+thicker than 5 cm (plaster, membranes... are ignored).
 
 BASIC (compound) walls:
-1- One wall per layer, placed exactly at the layer position
-   (copy of the original wall with a single-layer type).
-2- Doors, windows and wall openings are copied into EVERY new
+1- One wall per layer, placed exactly at the layer position.
+   The original wall becomes one of the layers (it keeps its id,
+   tags and dimensions), the others are new walls.
+2- Doors, windows and wall openings are copied into EVERY layer
    wall, so deleting one of the new walls keeps the openings in
    the others.
 3- Other hosted elements (fixtures...) are kept only in the
    layer closest to them.
 
 STACKED walls:
-1- For each member of the stack, one NEW basic wall per layer
-   thicker than 5 cm (plaster, membranes... are ignored), with
-   the position, base / top constraints and height of the member.
+1- For each member of the stack, one NEW basic wall per layer,
+   with the position, base / top constraints and height of the
+   member.
 2- Each new wall gets a copy of the doors / windows that cut
    that member in the original (same type, parameters, sill
-   and orientation).
-3- Each new wall also gets a rectangular Wall Opening, uniform
-   through the whole wall, with the LARGEST size the opening had
-   in that layer of the original (reveals / rebates included).
+   and orientation), and of its rectangular Wall Openings.
+
+CORNERS: when two split walls meet in an L, each layer is
+extended / trimmed to wrap around the corner with the matching
+layer of the other wall (structure with structure, then the
+layers outside / inside of it in order).
+When a split wall ends against another split wall (T), its
+layers stop at the face of the other wall.
 
 Layer types are created (or reused) per layer, named
-"<Material> (<width>cm)". The original wall is deleted. Only the
-layers with a structural function keep the "Structural" flag.
+"<Material> (<width>cm)". Only the layers with a structural
+function keep the "Structural" flag.
 
 Each wall is processed in its own transaction: if one wall
 fails, the others are still split and the error is reported.
@@ -37,9 +43,17 @@ ________________________________________________________________
 How-To:
 
 1. Select the walls (before or after clicking the button).
+   Select both walls of a corner to get it cleaned up.
 2. Review the report.
 ________________________________________________________________
 Last Updates:
+- [17.10.2026] v2.4 Layers < 5 cm ignored in basic walls too,
+                    layer-to-layer corners (L and T), original
+                    basic wall reused as a layer, faster (new
+                    layers created in place, one regeneration
+                    for all the doors / windows of a wall).
+                    Uniform openings removed: Revit deleted the
+                    doors / windows they left with nothing to cut.
 - [17.10.2026] v2.3 Stacked walls rebuilt: new basic walls per
                     layer > 5 cm, doors / windows recreated,
                     uniform through openings measured on the
@@ -65,14 +79,13 @@ import clr
 clr.AddReference('System')
 from System.Collections.Generic import List
 
-from Autodesk.Revit.DB import (Arc, BooleanOperationsType, BooleanOperationsUtils, BuiltInCategory, BuiltInParameter,
-                               CompoundStructure, CompoundStructureLayer, CurveLoop, CylindricalFace, Element,
-                               ElementClassFilter, ElementId, ElementTransformUtils, FailureProcessingResult,
-                               FailureSeverity, FamilyInstance, FilteredElementCollector, GeometryCreationUtilities,
+from Autodesk.Revit.DB import (Arc, BuiltInCategory, BuiltInParameter, CompoundStructure, CompoundStructureLayer,
+                               CylindricalFace, Element, ElementClassFilter, ElementId, ElementTransformUtils,
+                               FailureProcessingResult, FailureSeverity, FamilyInstance, FilteredElementCollector,
                                HostObjectUtils, IFailuresPreprocessor, Line, LocationPoint, MaterialFunctionAssignment,
-                               Opening, Options, PlanarFace, ShellLayerType, Solid, SolidUtils, StorageType,
+                               Opening, Options, PlanarFace, ShellLayerType, Solid, StorageType,
                                Transaction, TransactionGroup, TransactionStatus, Transform, Wall, WallKind, WallType,
-                               XYZ)
+                               WallUtils, XYZ)
 from Autodesk.Revit.DB.Structure import StructuralType
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 from Autodesk.Revit.Exceptions import OperationCanceledException
@@ -87,9 +100,7 @@ doc    = __revit__.ActiveUIDocument.Document #type:Document
 output = script.get_output()
 
 FT_TO_CM  = 30.48
-MIN_LAYER = 0.0016      # feet (~0.5 mm) basic walls: thinner layers (membranes) are skipped
-MIN_LAYER_STACKED = 5 / FT_TO_CM  # feet (5 cm) stacked walls: thinner layers (plaster...) are ignored
-EPS       = 0.003       # feet (~1 mm)  margin of the layer bands used to measure the openings
+MIN_LAYER = 5 / FT_TO_CM  # feet (5 cm)  thinner layers (plaster, membranes...) are ignored
 TOL_Z     = 0.033       # feet (~1 cm)  vertical tolerance for stacked members / inserts
 TOL_DIM   = 0.0003      # feet (~0.1 mm) width tolerance to reuse a layer type
 
@@ -335,17 +346,20 @@ def nearest_index(point, curves):
     return best
 
 
-def place_layer_wall(src_wall, layer_type, target, normal, layer_idx, all_targets, structural):
-    """Copies the basic wall (with its inserts), applies the layer type and moves it to the layer position.
-    Returns the number of openings in the new wall."""
-    copied   = ElementTransformUtils.CopyElements(doc, List[ElementId]([src_wall.Id]), XYZ.Zero)
-    new_wall = None
-    for eid in copied:
-        e = doc.GetElement(eid)
-        if isinstance(e, Wall):
-            new_wall = e
-    if new_wall is None:
-        raise Exception("The wall could not be copied")
+def place_layer_wall(src_wall, layer_type, target, normal, layer_idx, all_targets, structural, reuse=False):
+    """Copies the basic wall (with its inserts) - or reuses it - applies the layer type and moves it
+    to the layer position. Returns the layer wall."""
+    if reuse:
+        new_wall = src_wall
+    else:
+        copied   = ElementTransformUtils.CopyElements(doc, List[ElementId]([src_wall.Id]), XYZ.Zero)
+        new_wall = None
+        for eid in copied:
+            e = doc.GetElement(eid)
+            if isinstance(e, Wall):
+                new_wall = e
+        if new_wall is None:
+            raise Exception("The wall could not be copied")
     new_wall.Pinned = False
 
     # Non-opening hosted elements: only in the nearest layer (before moving the wall)
@@ -356,23 +370,49 @@ def place_layer_wall(src_wall, layer_type, target, normal, layer_idx, all_target
 
     new_wall.ChangeTypeId(layer_type.Id)
     set_param(new_wall, BuiltInParameter.WALL_KEY_REF_PARAM, 0)            # Location Line = Wall Centerline
-    doc.Regenerate()
-    move_to_curve(new_wall, target, normal)
-
     if not structural:
         set_param(new_wall, BuiltInParameter.WALL_STRUCTURAL_SIGNIFICANT, 0)
     doc.Regenerate()
-    return len([i for i in new_wall.FindInserts(True, False, False, False) if is_opening(doc.GetElement(i))])
+    move_to_curve(new_wall, target, normal)
+    return new_wall
+
+
+def can_rebuild(wall):
+    """False if a new wall cannot reproduce the wall (edited profile, attached top / base)."""
+    if wall.SketchId != ElementId.InvalidElementId:
+        return False
+    for bip in (BuiltInParameter.WALL_TOP_IS_ATTACHED, BuiltInParameter.WALL_BOTTOM_IS_ATTACHED):
+        p = wall.get_Parameter(bip)
+        if p is not None and p.AsInteger() == 1:
+            return False
+    return True
+
+
+def basic_member(wall):
+    """Data of a basic wall in the format of a stacked member (see stacked_members)."""
+    doors, holes = [], []
+    for eid in wall.FindInserts(True, False, False, False):
+        e = doc.GetElement(eid)
+        if isinstance(e, Opening):
+            holes.append(e)
+        elif isinstance(e, FamilyInstance) and is_opening(e):
+            doors.append(e)
+    curve = wall.Location.Curve
+    rects = [opening_rect(op, curve) for op in holes if op.IsRectBoundary]
+    return {"wall": wall, "curve": curve, "normal": wall.Orientation, "rel_bottom": 0.0,
+            "height": wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble(),
+            "is_top": True, "doors": doors, "holes": rects, "lost": len(holes) - len(rects)}
 
 
 def split_basic_wall(wall):
-    """Splits a basic wall. Returns (walls created, openings, warnings)."""
+    """Splits a basic wall. The original wall becomes one of the layers (the one closest to its fixtures,
+    else the structural one). Returns (layer walls, openings, warnings)."""
     cs = wall.WallType.GetCompoundStructure()
     if cs is None:
         raise Exception("Wall type without compound structure")
     layers = get_layers(cs, MIN_LAYER)
     if len(layers) < 2:
-        return 0, 0, []
+        return [], 0, []
 
     curve, normal = wall.Location.Curve, wall.Orientation
     ext     = ext_face_from_key_ref(wall, cs)
@@ -380,13 +420,39 @@ def split_basic_wall(wall):
     pieces  = [(get_layer_type(wall.WallType, layer), layer.Function == MaterialFunctionAssignment.Structure)
                for layer, _ in layers]
 
+    # Layers that need the fixtures of the wall (they must be copies of it)
+    fixture_layers = [nearest_index(pt, targets) for pt in
+                      [elem_point(fi) for fi in hosted_instances(wall)] if pt is not None]
+    structural = [i for i, piece in enumerate(pieces) if piece[1]]
+    if fixture_layers:
+        keep = max(set(fixture_layers), key=fixture_layers.count)
+    else:
+        keep = structural[0] if structural else 0
+    rebuild = can_rebuild(wall)
+    member  = basic_member(wall)
+
     if wall.Pinned:
         wall.Pinned = False
-    openings = 0
-    for i, (layer_type, structural) in enumerate(pieces):
-        openings += place_layer_wall(wall, layer_type, targets[i], normal, i, targets, structural)
-    doc.Delete(wall.Id)
-    return len(pieces), openings, []
+    walls, jobs = [None] * len(pieces), []
+    for i, (layer_type, is_structural) in enumerate(pieces):
+        if i == keep:
+            continue
+        if rebuild and i not in fixture_layers:
+            walls[i] = create_layer_wall(wall, member, layer_type, targets[i], is_structural)
+            jobs.append((walls[i], member["doors"], member["holes"], member["curve"]))
+        else:
+            walls[i] = place_layer_wall(wall, layer_type, targets[i], normal, i, targets, is_structural)
+    created, failed = add_openings(jobs)
+
+    # The original wall last: the copies above are made from it unchanged
+    walls[keep] = place_layer_wall(wall, pieces[keep][0], targets[keep], normal, keep, targets, pieces[keep][1],
+                                   reuse=True)
+
+    warnings = []
+    if failed or member["lost"]:
+        warnings.append("{} doors/windows/openings could not be created".format(failed + member["lost"]))
+    openings = len(member["doors"]) + len(member["holes"])
+    return walls, openings * (len(pieces) - len(jobs)) + created, warnings
 
 
 # ╔═╗╔╦╗╔═╗╔═╗╦╔═╔═╗╔╦╗  ╦ ╦╔═╗╦  ╦  ╔═╗
@@ -425,87 +491,13 @@ def opening_z_range(elem):
     return (bb.Min.Z, bb.Max.Z) if bb else None
 
 
-def wall_solid(wall):
-    """Union of the solids of the wall geometry (with all its cuts)."""
-    opts = Options()
-    opts.ComputeReferences = False
-    geom   = wall.get_Geometry(opts)
-    result = None
-    for obj in (geom or []):
-        if isinstance(obj, Solid) and obj.Volume > 1e-9:
-            if result is None:
-                result = obj
-            else:
-                result = BooleanOperationsUtils.ExecuteBooleanOperation(result, obj, BooleanOperationsType.Union)
-    return result
+def opening_rect(opening, curve):
+    """(u0, u1, z0, z1) of a rectangular wall opening, measured along 'curve' (curve parameter)."""
+    us = [curve.Project(p).Parameter for p in opening.BoundaryRect]
+    zs = [p.Z for p in opening.BoundaryRect]
+    return (min(us), max(us), min(zs), max(zs))
 
 
-def band_solid(curve, normal, a, b, z0, z1):
-    """Solid between the offsets a < b of the curve (towards 'normal'), from z0 to z1."""
-    if isinstance(curve, Line):
-        delta = EPS
-    elif isinstance(curve, Arc):
-        delta = EPS / curve.Radius
-    else:
-        return None
-    base = curve.Clone()
-    base.MakeBound(curve.GetEndParameter(0) + delta, curve.GetEndParameter(1) - delta)
-    base = base.CreateTransformed(Transform.CreateTranslation(XYZ(0, 0, z0 - base.GetEndPoint(0).Z)))
-    ca = offset_curve(base, a, normal)
-    cb = offset_curve(base, b, normal)
-    loop = CurveLoop()
-    loop.Append(ca)
-    loop.Append(Line.CreateBound(ca.GetEndPoint(1), cb.GetEndPoint(1)))
-    loop.Append(cb.CreateReversed())
-    loop.Append(Line.CreateBound(cb.GetEndPoint(0), ca.GetEndPoint(0)))
-    return GeometryCreationUtilities.CreateExtrusionGeometry(List[CurveLoop]([loop]), XYZ.BasisZ, z1 - z0)
-
-
-def uz_extents(solid, curve):
-    """(u0, u1, z0, z1): extents of the solid along the curve (curve parameter) and in height."""
-    us, zs = [], []
-    for edge in solid.Edges:
-        for p in edge.Tessellate():
-            us.append(curve.Project(p).Parameter)
-            zs.append(p.Z)
-    return (min(us), max(us), min(zs), max(zs)) if us else None
-
-
-def insert_in_rect(elem, curve, rect):
-    """True if the opening element lies inside the rectangle (u0, u1, z0, z1)."""
-    pt      = elem_point(elem)
-    z_range = opening_z_range(elem)
-    if pt is None or z_range is None:
-        return False
-    u = curve.Project(pt).Parameter
-    return (rect[0] - TOL_Z <= u <= rect[1] + TOL_Z) and z_range[1] > rect[2] and z_range[0] < rect[3]
-
-
-def layer_holes(member, solid, a, b):
-    """Openings of the original member inside the layer band [a, b] (distance from the member curve
-    towards the exterior), as uniform rectangles (u0, u1, z0, z1) with their LARGEST extents."""
-    curve, normal = member["curve"], member["normal"]
-    zb, zt = member["zmin"], member["zmax"]
-    band   = band_solid(curve, normal, a + EPS, b - EPS, zb + EPS, zt - EPS)
-    if band is None:
-        return None
-    voids = BooleanOperationsUtils.ExecuteBooleanOperation(band, solid, BooleanOperationsType.Difference)
-
-    holes = []
-    for lump in SolidUtils.SplitVolumes(voids):
-        if lump.Volume < 1e-4:
-            continue
-        rect = uz_extents(lump, curve)
-        # Only voids of an opening of the original wall (not end joins / top profile)
-        if rect is None or not any(insert_in_rect(e, curve, rect) for e in member["all_inserts"]):
-            continue
-        u0, u1, z0, z1 = rect
-        if z0 <= zb + 3 * EPS:
-            z0 = zb
-        if z1 >= zt - 3 * EPS:
-            z1 = zt
-        holes.append((u0, u1, z0, z1))
-    return holes
 
 
 def stacked_members(wall):
@@ -519,17 +511,16 @@ def stacked_members(wall):
         members.append((bb.Min.Z, bb.Max.Z, member))
     members.sort(key=lambda m: m[0])
 
-    # Openings of the stacked wall (hosted by the stacked wall or by its members) + embedded walls
-    doors, all_inserts = {}, {}
+    # Doors / windows and wall openings of the stacked wall (hosted by the stacked wall or by its members)
+    doors, openings = {}, {}
     for host in [wall] + [m[2] for m in members]:
-        for eid in host.FindInserts(True, False, True, False):
+        for eid in host.FindInserts(True, False, False, False):
             e = doc.GetElement(eid)
-            if e is None:
-                continue
-            all_inserts[eid.ToString()] = e
-            if isinstance(e, FamilyInstance) and is_opening(e):
+            if isinstance(e, Opening):
+                openings[eid.ToString()] = e
+            elif isinstance(e, FamilyInstance) and is_opening(e):
                 doors[eid.ToString()] = e
-    doors, all_inserts = list(doors.values()), list(all_inserts.values())
+    doors, openings = list(doors.values()), list(openings.values())
     cut_sets = [cutting_ids(m[2]) for m in members]
     found    = set().union(*cut_sets) if cut_sets else set()
 
@@ -555,10 +546,20 @@ def stacked_members(wall):
                 if z_range and z_range[1] > zmin + TOL_Z and z_range[0] < top_z - TOL_Z:
                     wanted.append(e)
 
+        # Rectangular wall openings that cross the height of this member
+        holes, lost = [], 0
+        for op in openings:
+            if not op.IsRectBoundary:
+                lost += 1
+                continue
+            rect = opening_rect(op, curve)
+            if rect[3] > zmin + TOL_Z and rect[2] < top_z - TOL_Z:
+                holes.append(rect)
+
         result.append({"wall": member, "type": member.WallType, "cs": cs, "curve": curve,
                        "normal": member.Orientation, "ext": ext, "rel_bottom": zmin - z0,
                        "height": top_z - zmin, "zmin": zmin, "zmax": top_z, "is_top": is_top,
-                       "doors": wanted, "all_inserts": all_inserts})
+                       "doors": wanted, "holes": holes, "lost": lost})
     return result
 
 
@@ -610,18 +611,45 @@ def copy_wall_params(src, dst):
 
 
 def recreate_door(orig, wall):
-    """Creates in 'wall' a copy of the original door / window (type, parameters, sill, orientation)."""
+    """Creates in 'wall' a copy of the original door / window (type, parameters, sill).
+    The orientation is matched later by add_openings (it needs a regeneration)."""
     level = doc.GetElement(orig.LevelId) or doc.GetElement(wall.LevelId)
     point = point_on_wall(orig.Location.Point, wall)
     inst  = doc.Create.NewFamilyInstance(XYZ(point.X, point.Y, level.ProjectElevation),
                                          orig.Symbol, wall, level, StructuralType.NonStructural)
     copy_instance_params(orig, inst)
-    doc.Regenerate()
-    if inst.CanFlipFacing and inst.FacingOrientation.DotProduct(orig.FacingOrientation) < 0:
-        inst.flipFacing()
+    return inst
+
+
+def add_openings(jobs):
+    """jobs: [(wall, doors, holes, curve)]. Recreates the doors / windows and creates the rectangular
+    openings (measured on 'curve') in each wall, with only two regenerations. Returns (created, failed)."""
+    if not jobs:
+        return 0, 0
+    doc.Regenerate()                                                        # the hosts need their geometry
+    created, failed, insts = 0, 0, []
+    for wall, doors, holes, curve in jobs:
+        for door in doors:
+            try:
+                insts.append((recreate_door(door, wall), door))
+            except Exception:
+                failed += 1
+        for hole in holes:
+            try:
+                create_hole(wall, curve, hole)
+                created += 1
+            except Exception:
+                failed += 1
+    if insts:
         doc.Regenerate()
-    if inst.CanFlipHand and inst.HandOrientation.DotProduct(orig.HandOrientation) < 0:
-        inst.flipHand()
+        for inst, orig in insts:
+            flip_facing = inst.CanFlipFacing and inst.FacingOrientation.DotProduct(orig.FacingOrientation) < 0
+            flip_hand   = inst.CanFlipHand and inst.HandOrientation.DotProduct(orig.HandOrientation) < 0
+            if flip_facing:
+                inst.flipFacing()
+            if flip_hand:
+                inst.flipHand()
+    return created + len(insts), failed
 
 
 def create_hole(wall, curve, hole):
@@ -633,13 +661,18 @@ def create_hole(wall, curve, hole):
 
 
 def create_layer_wall(stacked, member, layer_type, target, structural):
-    """Creates a new basic wall for one layer of a stacked member, with the member's constraints."""
+    """Creates a new basic wall for one layer of a stacked member (or of a basic wall), with the
+    member's constraints, centered on 'target' with its exterior towards the member's exterior."""
     base_level = stacked.get_Parameter(BuiltInParameter.WALL_BASE_CONSTRAINT).AsElementId()
     base_off   = stacked.get_Parameter(BuiltInParameter.WALL_BASE_OFFSET).AsDouble() + member["rel_bottom"]
     top_level  = stacked.get_Parameter(BuiltInParameter.WALL_HEIGHT_TYPE).AsElementId()
 
     level_z = doc.GetElement(base_level).ProjectElevation
     curve   = target.CreateTransformed(Transform.CreateTranslation(XYZ(0, 0, level_z - target.GetEndPoint(0).Z)))
+    # A new wall has its exterior at Z x direction and its Location Line at the Wall Centerline
+    in_place = isinstance(curve, Line)
+    if in_place and XYZ.BasisZ.CrossProduct(curve.Direction).DotProduct(member["normal"]) < 0:
+        curve = curve.CreateReversed()
     new_wall = Wall.Create(doc, curve, layer_type.Id, base_level, member["height"], base_off, False, structural)
 
     if member["is_top"]:
@@ -651,15 +684,16 @@ def create_layer_wall(stacked, member, layer_type, target, structural):
             set_param(new_wall, BuiltInParameter.WALL_USER_HEIGHT_PARAM,
                       stacked.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble() - member["rel_bottom"])
     copy_wall_params(stacked, new_wall)
-
-    # Same exterior side as the member, then exact position of the layer centerline
     set_param(new_wall, BuiltInParameter.WALL_KEY_REF_PARAM, 0)
+    if in_place:
+        return new_wall
+
+    # Arcs: same exterior side as the member, then exact position of the layer centerline
     doc.Regenerate()
     if new_wall.Orientation.DotProduct(member["normal"]) < 0:
         new_wall.Flip()
         doc.Regenerate()
     move_to_curve(new_wall, target, member["normal"])
-    doc.Regenerate()
     return new_wall
 
 
@@ -670,59 +704,224 @@ def split_stacked_wall(wall):
     stacked_structural = bool(stacked_structural and stacked_structural.AsInteger())
 
     # 1- Measure everything on the original (before modifying anything)
-    pieces, warnings = [], []
+    pieces, warnings, lost = [], [], 0
     for member in stacked_members(wall):
-        layers  = get_layers(member["cs"], MIN_LAYER_STACKED)
-        solid   = None
-        if member["all_inserts"]:
-            try:
-                solid = wall_solid(member["wall"])
-            except Exception:
-                solid = None
-            if solid is None:
-                warnings.append("openings of member {} could not be measured".format(member["wall"].Id))
+        lost  += member["lost"]
+        layers = get_layers(member["cs"], MIN_LAYER)
         for layer, acc in layers:
             b      = member["ext"] - acc                   # exterior side of the layer
             target = offset_curve(member["curve"], b - layer.Width / 2.0, member["normal"])
-            holes  = []
-            if solid is not None:
-                try:
-                    holes = layer_holes(member, solid, b - layer.Width, b) or []
-                except Exception:
-                    warnings.append("openings of a layer of member {} could not be measured".format(member["wall"].Id))
             if member["cs"].LayerCount == 1:
                 layer_type = member["type"]                 # single-layer member keeps its own type
             else:
                 layer_type = get_layer_type(member["type"], layer)
             structural = stacked_structural and layer.Function == MaterialFunctionAssignment.Structure
-            pieces.append((member, layer_type, target, structural, holes))
+            pieces.append((member, layer_type, target, structural, member["holes"]))
 
     if not pieces:
-        return 0, 0, warnings
+        return [], 0, warnings
 
-    # 2- Create the new walls with their doors / windows and uniform openings
-    created_openings, failed = 0, 0
+    # 2- Create the new walls, then their doors / windows and wall openings
+    walls, jobs = [], []
     for member, layer_type, target, structural, holes in pieces:
         new_wall = create_layer_wall(wall, member, layer_type, target, structural)
-        for door in member["doors"]:
-            try:
-                recreate_door(door, new_wall)
-                created_openings += 1
-            except Exception:
-                failed += 1
-        for hole in holes:
-            try:
-                create_hole(new_wall, member["curve"], hole)
-                created_openings += 1
-            except Exception:
-                failed += 1
-    if failed:
-        warnings.append("{} doors/windows/openings could not be created".format(failed))
+        walls.append(new_wall)
+        jobs.append((new_wall, member["doors"], holes, member["curve"]))
+    created_openings, failed = add_openings(jobs)
+    if failed or lost:
+        warnings.append("{} doors/windows/openings could not be created".format(failed + lost))
 
     if wall.Pinned:
         wall.Pinned = False
     doc.Delete(wall.Id)
-    return len(pieces), created_openings, warnings
+    return walls, created_openings, warnings
+
+
+# ╔═╗╔═╗╦═╗╔╗╔╔═╗╦═╗╔═╗
+# ║  ║ ║╠╦╝║║║║╣ ╠╦╝╚═╗
+# ╚═╝╚═╝╩╚═╝╚╝╚═╝╩╚═╚═╝
+#==================================================
+def wall_width(wall):
+    if wall.IsStackedWall:
+        return max(doc.GetElement(i).Width for i in wall.GetStackedWallMemberIds())
+    return wall.Width
+
+
+def end_neighbors(wall):
+    """Ids (as text) of the walls joined at each end of the wall (stacked members -> their stacked wall)."""
+    curve  = wall.Location.Curve
+    result = [set(), set()]
+    hosts  = [wall] + ([doc.GetElement(i) for i in wall.GetStackedWallMemberIds()] if wall.IsStackedWall else [])
+    for host in hosts:
+        host_curve = host.Location.Curve
+        for host_end in (0, 1):
+            end = near_end(curve, host_curve.GetEndPoint(host_end))
+            for e in host.Location.get_ElementsAtJoin(host_end):
+                if not isinstance(e, Wall):
+                    continue
+                if e.IsStackedWallMember:
+                    e = doc.GetElement(e.StackedWallOwnerId)
+                if e.Id != wall.Id:
+                    result[end].add(e.Id.ToString())
+    return result
+
+
+def near_end(curve, point):
+    return 0 if curve.GetEndPoint(0).DistanceTo(point) <= curve.GetEndPoint(1).DistanceTo(point) else 1
+
+
+def flat(v):
+    return XYZ(v.X, v.Y, 0)
+
+
+def layer_info(wall):
+    bb = wall.get_BoundingBox(None)
+    cs = wall.WallType.GetCompoundStructure()
+    structure = cs is not None and cs.LayerCount == 1 and \
+        cs.GetLayers()[0].Function == MaterialFunctionAssignment.Structure
+    return {"wall": wall, "line": wall.Location.Curve, "width": wall.Width, "z": (bb.Min.Z, bb.Max.Z),
+            "structure": structure}
+
+
+def split_at_core(rank):
+    """Layers ranked from the outside -> (outside layers from the core outwards, core, inside layers from
+    the core inwards). The core is the thickest structural layer (else the thickest layer)."""
+    core = max([i for i in rank if i["structure"]] or rank, key=lambda i: i["width"])
+    c    = rank.index(core)
+    return rank[:c][::-1], core, rank[c + 1:]
+
+
+def z_overlap(a, b):
+    return min(a["z"][1], b["z"][1]) - max(a["z"][0], b["z"][0])
+
+
+def z_groups(infos):
+    """Layer walls grouped by height (one group per stacked member)."""
+    groups = {}
+    for info in infos:
+        groups.setdefault((round(info["z"][0], 2), round(info["z"][1], 2)), []).append(info)
+    return list(groups.values())
+
+
+def pos(info, origin, u):
+    """Distance from origin to the layer centerline, along u."""
+    return flat(info["line"].GetEndPoint(0) - origin).DotProduct(u)
+
+
+def point_at(info, origin, u, value):
+    """Point of the (unbounded) layer centerline at distance 'value' from origin along u."""
+    p0, d = info["line"].GetEndPoint(0), info["line"].Direction
+    den = d.DotProduct(u)
+    if abs(den) < 1e-6:
+        return None
+    return p0 + d.Multiply((value - flat(p0 - origin).DotProduct(u)) / den)
+
+
+def corner_l(w_infos, n_infos, origin, d_w, d_n, propose):
+    """L corner. The layers are paired from the core (core with core, then the layers outside / inside
+    of the core in order). Each pair forms a clean L: the layer of W goes up to the outer face of its
+    pair and the layer of N stops at the inner face of its pair (outer = towards the outside of the
+    corner). Unpaired layers close the corner outside, or stop at the inner face of the other wall."""
+    u_w = flat(d_w.Multiply(d_n.DotProduct(d_w)) - d_n).Normalize()      # outside of W
+    u_n = flat(d_n.Multiply(d_w.DotProduct(d_n)) - d_w).Normalize()      # outside of N
+
+    def outer(info, u):
+        return pos(info, origin, u) + info["width"] / 2.0
+
+    def inner(info, u):
+        return pos(info, origin, u) - info["width"] / 2.0
+
+    for gw in z_groups(w_infos):
+        for gn in z_groups(n_infos):
+            weight = z_overlap(gw[0], gn[0])
+            if weight < TOL_Z:
+                continue
+            w_out, w_core, w_in = split_at_core(sorted(gw, key=lambda i: -pos(i, origin, u_w)))
+            n_out, n_core, n_in = split_at_core(sorted(gn, key=lambda i: -pos(i, origin, u_n)))
+            ends = []                                                   # (layer, distance, axis)
+            for a, b in [(w_core, n_core)] + list(zip(w_out, n_out)) + list(zip(w_in, n_in)):
+                ends += [(a, outer(b, u_n), u_n), (b, inner(a, u_w), u_w)]
+            ends += [(a, outer((n_out or [n_core])[-1], u_n), u_n) for a in w_out[len(n_out):]]
+            ends += [(b, outer((w_out or [w_core])[-1], u_w), u_w) for b in n_out[len(w_out):]]
+            ends += [(a, inner((n_in or [n_core])[-1], u_n), u_n) for a in w_in[len(n_in):]]
+            ends += [(b, inner((w_in or [w_core])[-1], u_w), u_w) for b in n_in[len(w_in):]]
+            for info, face, u in ends:
+                propose(info, origin, point_at(info, origin, u, face), weight)
+
+
+def corner_t(w_infos, n_infos, origin, d_w, d_n, propose):
+    """T: each layer of W stops at the face of N on the side of W."""
+    v = flat(d_w - d_n.Multiply(d_w.DotProduct(d_n))).Normalize()        # from N towards W
+    for a in w_infos:
+        faces = [pos(b, origin, v) + b["width"] / 2.0 for b in n_infos if z_overlap(a, b) > TOL_Z]
+        if faces:
+            propose(a, origin, point_at(a, origin, v, max(faces)), z_overlap(a, a))
+
+
+def fix_corners(sources):
+    """Extends / trims the layer walls at the ends where two split walls were joined.
+    sources: {id: {"curve", "width", "ends", "layers"}} measured before splitting. Returns the corners fixed."""
+    infos = {}
+    for sid, s in sources.items():
+        walls = [w for w in s["layers"] if w.IsValidObject and isinstance(w.Location.Curve, Line)]
+        if walls and isinstance(s["curve"], Line):
+            infos[sid] = [layer_info(w) for w in walls]
+
+    proposals, handled, corners = {}, set(), 0
+
+    def propose(info, origin, point, weight):
+        if point is None:
+            return
+        end = near_end(info["line"], origin)
+        if point.DistanceTo(info["line"].GetEndPoint(end)) > max_shift:
+            return
+        key = (info["wall"].Id.ToString(), end)
+        if key not in proposals or proposals[key][0] < weight:
+            proposals[key] = (weight, point, info["wall"], end)
+
+    for sid in sorted(infos, key=int):
+        s = sources[sid]
+        for end in (0, 1):
+            if (sid, end) in handled:
+                continue
+            origin = s["curve"].GetEndPoint(end)
+            d_w    = flat(s["curve"].GetEndPoint(1 - end) - origin).Normalize()
+            l_best, t_best = None, None
+            for nid in s["ends"][end]:
+                if nid not in infos:
+                    continue
+                n   = sources[nid]
+                tol = s["width"] + n["width"]
+                n_end = near_end(n["curve"], origin)
+                q     = n["curve"].GetEndPoint(n_end)
+                if flat(q - origin).GetLength() < tol:
+                    d_n   = flat(n["curve"].GetEndPoint(1 - n_end) - q).Normalize()
+                    cross = abs(d_w.CrossProduct(d_n).Z)
+                    if cross > 0.2 and (l_best is None or cross > l_best[0]):
+                        l_best = (cross, nid, n_end, d_n)
+                elif t_best is None:
+                    t_best = (nid, n["curve"].Direction)
+            if l_best is not None:
+                _, nid, n_end, d_n = l_best
+                max_shift = 2 * (s["width"] + sources[nid]["width"])
+                corner_l(infos[sid], infos[nid], origin, d_w, d_n, propose)
+                handled.add((nid, n_end))
+                corners += 1
+            elif t_best is not None:
+                nid, d_n = t_best
+                max_shift = 2 * (s["width"] + sources[nid]["width"])
+                corner_t(infos[sid], infos[nid], origin, d_w, d_n, propose)
+                corners += 1
+
+    for weight, point, wall, end in proposals.values():
+        WallUtils.DisallowWallJoinAtEnd(wall, end)
+        line  = wall.Location.Curve
+        other = line.GetEndPoint(1 - end)
+        point = XYZ(point.X, point.Y, line.GetEndPoint(end).Z)
+        if point.DistanceTo(other) < 0.03:
+            continue
+        wall.Location.Curve = Line.CreateBound(point, other) if end == 0 else Line.CreateBound(other, point)
+    return corners
 
 
 # ╔╦╗╔═╗╦╔╗╔
@@ -736,8 +935,18 @@ if not walls:
 for wt in FilteredElementCollector(doc).OfClass(WallType):
     TYPES[get_name(wt)] = wt
 
+# Ends and joins of every wall, measured before any of them is split
+sources = {}
+for wall in walls:
+    try:
+        sources[wall.Id.ToString()] = {"curve": wall.Location.Curve.Clone(), "width": wall_width(wall),
+                                       "ends": end_neighbors(wall), "layers": []}
+    except Exception:
+        pass
+
 report = []         # [wall id, type, result]
 created_total = 0
+corners = 0
 
 tg = TransactionGroup(doc, "Split Walls")
 tg.Start()
@@ -762,19 +971,22 @@ with forms.ProgressBar(title="Splitting walls... ({value} of {max_value})", canc
         t.SetFailureHandlingOptions(options)
         t.Start()
         try:
+            source_id = wall.Id.ToString()
             if wall.IsStackedWall:
-                created, openings, warnings = split_stacked_wall(wall)
+                layer_walls, openings, warnings = split_stacked_wall(wall)
             else:
-                created, openings, warnings = split_basic_wall(wall)
-            if created == 0:
+                layer_walls, openings, warnings = split_basic_wall(wall)
+            if not layer_walls:
                 t.RollBack()
                 report.append([wall_id, type_name, "Skipped: only one layer"])
                 continue
             if t.Commit() != TransactionStatus.Committed:
                 report.append([wall_id, type_name, "ERROR: Revit rejected the changes"])
                 continue
-            created_total += created
-            result = "OK: {} walls, {} openings".format(created, openings)
+            if source_id in sources:
+                sources[source_id]["layers"] = layer_walls
+            created_total += len(layer_walls)
+            result = "OK: {} walls, {} openings".format(len(layer_walls), openings)
             if warnings:
                 result += " - WARNING: " + "; ".join(warnings)
             report.append([wall_id, type_name, result])
@@ -784,11 +996,30 @@ with forms.ProgressBar(title="Splitting walls... ({value} of {max_value})", canc
             report.append([wall_id, type_name, "ERROR: {}".format(ex)])
             print(traceback.format_exc())
 
+# Layer-to-layer corners between the split walls
+if created_total:
+    t = Transaction(doc, "Split Walls - Corners")
+    options = t.GetFailureHandlingOptions()
+    options.SetFailuresPreprocessor(SilentFailures())
+    options.SetClearAfterRollback(True)
+    t.SetFailureHandlingOptions(options)
+    t.Start()
+    try:
+        corners = fix_corners(sources)
+        if t.Commit() != TransactionStatus.Committed:
+            corners = "ERROR: Revit rejected the corners"
+    except Exception as ex:
+        if t.HasStarted() and not t.HasEnded():
+            t.RollBack()
+        corners = "ERROR: {}".format(ex)
+        print(traceback.format_exc())
+
 if created_total:
     tg.Assimilate()
 else:
     tg.RollBack()
 
 output.print_md("## Split Walls")
-output.print_md("**{}** walls processed, **{}** new walls created.".format(len(report), created_total))
+output.print_md("**{}** walls processed, **{}** layer walls, corners: **{}**.".format(len(report), created_total,
+                                                                                     corners))
 output.print_table(report, columns=["Wall", "Type", "Result"])
