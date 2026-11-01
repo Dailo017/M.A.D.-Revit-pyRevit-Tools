@@ -38,6 +38,7 @@ Then click **pyRevit ▸ Reload** (or restart Revit).
 | **Reference Level** | Changes the reference level of the selected elements **without moving them** (the offset is recalculated): pipes, ducts, cable trays, conduits, fittings, equipment, lighting fixtures, electrical/data devices, generic models, doors, windows, walls, shafts, floors, foundations, columns, beams (also horizontal ones drawn on their level), ceilings, roofs, stairs and model groups. Elements are processed in blocks with a single regeneration each. After the change, each element, what it hosts and what it is connected to are compared with the original: misaligned MEP joints may be re-aligned by Revit (up to 5 mm); anything that would move more, or that gives a Revit error (disconnection, line too short…), is left untouched. Curtain panels, wall foundations and wall-hosted families take their host's level and follow it. Beams drawn on their own level (work plane) are changed only if Revit keeps their end joins; otherwise they are left untouched. The elements that could not be changed stay selected. One Undo. |
 | **Room Tags From Link** | Places a room tag on every room of a linked model, in every floor plan view of the project. |
 | **UPPER / Lowercase** | Renames the families and/or types of the project to UPPERCASE or lowercase. |
+| **Why Not Here?** ⚠️ *Not my work – by Dimitris Koumantakis* | Pick one host-model element and a target graphical view: a modeless window reports why the element is not visible there, grouped into confirmed blockers, possible issues and passed checks (individual hide, category visibility, filters, view range, crop region, phase, discipline…). Offers safe, reversible fixes with undo for scoped view settings only. **This tool is entirely written by [Dimitris Koumantakis](#credits) and is included here as-is, copied without changes.** |
 
 ### MEP
 
@@ -97,7 +98,11 @@ MAD.extension/
 - **Dailo Lorenzo Perez** – author of most tools.
 - **Split Walls** – adapted from Mohamed Mostafa Bedair, Joven Mark Gumana and Erik Frits.
 - **Walls From Lines** – adapted from Aaron Rumple.
+- **Why Not Here?** – **not my work.** This tool is entirely authored by **Dimitris Koumantakis**
+  and is copied into this extension without modification. All credit for its design and code
+  belongs to him; I am only redistributing it alongside the M.A.D tools.
 
 ## License
 
-[MIT](LICENSE) © 2026 Dailo017
+[MIT](LICENSE) © 2026 Dailo017 — applies to the tools authored by me.
+**Why Not Here?** is the work of Dimitris Koumantakis and is not covered by my authorship claim.
