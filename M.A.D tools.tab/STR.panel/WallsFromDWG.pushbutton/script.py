@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 __title__   = "Walls From\nDWG"
-__doc__     = """Version = 1.2
-Date    = 03.11.2026
+__doc__     = """Version = 1.3
+Date    = 14.11.2026
 ________________________________________________________________
 Description:
 
@@ -14,18 +14,22 @@ Creates walls, doors and windows from the layers of a DWG
 2- Two parallel lines of the same layer closer than the max
    width = the two faces of a wall: the wall is placed on their
    center line with the width measured in the DWG (rounded to
-   5 mm).
+   5 mm). Walls drawn with all their layers (boards, core...)
+   are read as one wall with their whole width.
 3- A line without a parallel partner = the center line of a
    wall with the width chosen in the form.
 4- Where both faces stop and lines of a door / window layer are
    drawn in the gap, the wall goes on through the opening and a
    door / window is placed in it, with the width of the gap
-   (doors up to 2.5 m, wider gaps stay open).
+   (doors up to 2.5 m, wider gaps stay open). A gap with a door
+   and a side window / fixed panel is split using the door arcs.
    Doors are flipped to swing like the arc of the DWG.
 5- Missing wall widths and door / window sizes get new types,
    duplicated from the chosen type / family.
-6- Ends are extended to the center line of the wall they run
-   into, so that Revit joins the walls (L, T, cross).
+6- A wall drawn on two layers is created once (the wider one).
+   Short thick blocks that touch no wall (columns) are skipped.
+7- Ends are moved to the center line of the wall they run into,
+   so that Revit joins the walls (L, T, cross).
 ________________________________________________________________
 How-To:
 
@@ -36,6 +40,13 @@ How-To:
    hatch, axis or furniture).
 ________________________________________________________________
 Last Updates:
+- [14.11.2026] v1.3 Layered walls (several parallel lines) and shafts:
+                    no thick walls across the void / two walls merged,
+                    walls on two layers or crossing inside another one
+                    created once, L corners trimmed to the center line,
+                    door + side window / panel split, joints < 25 cm
+                    are not doors, free-standing blocks (columns) skipped,
+                    a door / window needs lines at both jambs of the gap
 - [03.11.2026] v1.2 Faces are paired only within the same layer (no
                     thick / overlapping walls between two layers),
                     doors wider than 2.5 m are not placed
@@ -82,8 +93,10 @@ POINT_TOL = 0.003        # ~1 mm, same point
 OFF_TOL   = 0.033        # ~1 cm, same line (collinear)
 ANG_TOL   = 0.01         # rad (~0.6°), parallel
 MIN_SEG   = 0.33         # ~10 cm, shorter walls are not created
-SNAP_TOL  = 0.066        # ~2 cm, extra reach when an end is extended
+SNAP_TOL  = 0.15         # ~4.5 cm, extra reach when an end is moved to the wall it runs into
 MIN_JOIN_SIN = 0.17      # ~10°, walls closer to parallel are not joined
+PARALLEL_SIN = 0.035     # ~2°, walls this parallel in the same band are the same wall
+BLOCK_RATIO = 2.0        # a wall shorter than this x its width that touches no wall is a column / pier
 TOL_DIM   = 1e-4         # same width
 
 MIN_WIDTH = 50 * MM      # closer parallel lines draw the same face (double contour)
@@ -96,6 +109,10 @@ WIDTH_TOL = 40 * MM      # same wall measured with a width this different (inner
 MAX_OPENING = 16.4       # ~5 m, wider gaps are never bridged
 MAX_DOOR    = 8.2        # ~2.5 m, a wider gap is a passage (door lines nearby belong to another door)
 JAMB_TOL    = 0.164      # ~5 cm, door / window lines this close to the wall band / jambs count
+MIN_OPENING = 0.82       # ~25 cm, a narrower gap with door / window lines is a joint: the wall goes on
+SIDE_MIN    = 1.31       # ~40 cm, what is left beside the leaves of a door is another element
+DOOR_FRAME  = 0.13       # ~4 cm, frame between the leaf of a door and the element beside it
+OPENING_SLACK = 0.15     # door / window lines must reach this close (x gap) to both ends of the gap
 WINDOW_BAND = 0.33       # ~10 cm, window lines may stick out of the wall (sills)
 
 CHUNK = 50               # elements per transaction (cancel keeps the finished ones)
@@ -105,7 +122,7 @@ ROLES = [ROLE_NONE, ROLE_WALLS, ROLE_DOORS, ROLE_WINDOWS]
 # Role guessed from the words of the layer name (a word starts with a key; 'PORTE'
 # must be the whole word: 'PORTEURS' = load-bearing walls, not doors)
 ROLE_KEYS = [(ROLE_NONE,    (u'MOBIL', u'FURN', u'TRAM', u'HATCH', u'RAYAD', u'HACH', u'COTA', u'COTE',
-                             u'DIM', u'TEXT', u'RIDEAU', u'CURTAIN', u'CORTINA')),
+                             u'DIM', u'TEXT', u'RIDEAU', u'CURTAIN', u'CORTINA', u'HORS=')),
              (ROLE_DOORS,   (u'PUERT', u'DOOR', u'PORTE=', u'PORTES=')),
              (ROLE_WINDOWS, (u'VENTAN', u'WINDOW', u'FENET', u'FEN\xcaT')),
              (ROLE_WALLS,   (u'MUR', u'WALL', u'TABIQ', u'PARED', u'FACHAD', u'CLOIS'))]
@@ -209,8 +226,9 @@ def merge_collinear(segs, gap):
 
 # ── Doors / windows of the DWG ────────────────────
 class PointIndex(object):
-    """Grid of the points of the door / window layers: (point, tag), tag =
-    'door', 'window' or 'hinge' (center of a door arc)."""
+    """Grid of the points of the door / window layers: (point, tag, arc ends),
+    tag = 'door', 'window' or 'hinge' (center of a door arc, with the two ends
+    of the arc)."""
     CELL = 3.0
 
     def __init__(self):
@@ -219,8 +237,8 @@ class PointIndex(object):
     def cell(self, v):
         return int(math.floor(v / self.CELL))
 
-    def add(self, pt, tag):
-        self.cells.setdefault((self.cell(pt[0]), self.cell(pt[1])), []).append((pt, tag))
+    def add(self, pt, tag, ends=None):
+        self.cells.setdefault((self.cell(pt[0]), self.cell(pt[1])), []).append((pt, tag, ends))
 
     def near(self, c, r):
         for i in range(self.cell(c[0] - r), self.cell(c[0] + r) + 1):
@@ -242,44 +260,116 @@ def build_index(layers, roles):
             for p in pts:
                 index.add(p, tag)
             if tag == 'door':
-                index.add(center, 'hinge')
+                index.add(center, 'hinge', (pts[0], pts[-1]))
     return index
 
 
-def find_opening(index, d, off, w_mm, ta, tb):
-    """Door / window drawn in the gap [ta, tb] of the wall (offset off, direction d)
-    -> dict, or None (passage: the gap stays open)."""
+def find_openings(index, d, off, w_mm, ta, tb):
+    """Doors / windows drawn in the gap [ta, tb] of the wall (offset off, direction d)
+    -> [openings] (the wall goes on through the gap; [] = a joint, nothing to place)
+    or None (passage: the gap stays open).
+    The arcs of the doors give their leaves (hinge -> end of the arc on the wall).
+    Two leaves whose tips meet = one double door, hinges side by side = two doors.
+    What is left beside the leaves (>= SIDE_MIN) is another element: a side window,
+    a fixed / sliding panel. Without arcs the gap is one door / window."""
     n = (-d[1], d[0])
     half_w, length = w_mm * MM / 2.0, tb - ta
     center = add(mul(d, (ta + tb) / 2.0), mul(n, off))
-    counts = {'door': 0, 'window': 0}
-    side, hinge = 0.0, 0
-    for pt, tag in index.near(center, length / 2.0 + half_w + length + JAMB_TOL):
+    doors, windows, swings, leaves, hinge = [], [], [], [], 0
+    slack = max(3 * JAMB_TOL, OPENING_SLACK * length)      # how far from a jamb the lines may stop
+    before = after = False                                 # lines in the band just past the jambs
+    for pt, tag, ends in index.near(center, length / 2.0 + half_w + length + JAMB_TOL):
         t, o = dot(pt, d), dot(pt, n) - off
         if not ta - JAMB_TOL <= t <= tb + JAMB_TOL:
+            if tag != 'hinge' and abs(o) <= half_w + JAMB_TOL:
+                before = before or ta - slack <= t < ta
+                after = after or tb < t <= tb + slack
             continue
         if tag == 'hinge':
-            if abs(o) <= half_w + JAMB_TOL and min(t - ta, tb - t) <= JAMB_TOL:
+            if abs(o) > half_w + JAMB_TOL:
+                continue
+            tip = min(ends, key=lambda q: abs(dot(q, n) - off))     # closed leaf
+            tt = dot(tip, d)
+            if (abs(dot(tip, n) - off) <= half_w + JAMB_TOL and ta - JAMB_TOL <= tt <= tb + JAMB_TOL
+                    and abs(tt - t) >= MIN_OPENING):
+                leaves.append((min(t, tt), max(t, tt), -1 if t < tt else 1))
+            elif min(t - ta, tb - t) <= JAMB_TOL:
                 hinge = -1 if t - ta < tb - t else 1
         elif tag == 'window' and abs(o) <= half_w + WINDOW_BAND:
-            counts['window'] += 1
+            windows.append(t)
         elif tag == 'door':
             if abs(o) <= half_w + JAMB_TOL:
-                counts['door'] += 1
+                doors.append(t)
             elif abs(o) <= half_w + length + JAMB_TOL:
-                side += o                                   # leaf / swing out of the wall
-    if counts['window'] > counts['door']:
-        kind = 'window'
-    elif (counts['door'] or hinge) and length <= MAX_DOOR:
-        kind = 'door'
-    else:
+                swings.append((t, o))                      # leaf / swing out of the wall
+    if length < MIN_OPENING:
+        return [] if doors or windows or leaves or hinge else None
+    # A door / window is drawn from jamb to jamb: lines at one end only belong to
+    # something else that touches the wall there (a glazed partition, another door)
+    marks = doors + windows + [t for leaf in leaves for t in leaf[:2]]
+    if marks and ((min(marks) - ta > slack and not before) or (tb - max(marks) > slack and not after)):
         return None
-    return {'kind':   kind,
-            'center': center,
-            'width':  round_width(length),
-            'dir':    d,
-            'swing':  mul(n, sign(side)) if kind == 'door' and side else None,   # side of the swing
-            'hinge':  mul(d, hinge) if kind == 'door' and hinge else None}      # hinge jamb from the center
+
+    def opening(kind, t0, t1, hinge_side):
+        side = sum(o for t, o in swings if t0 <= t <= t1) if kind == 'door' else 0.0
+        return {'kind':   kind,
+                'center': add(mul(d, (t0 + t1) / 2.0), mul(n, off)),
+                'width':  round_width(t1 - t0),
+                'dir':    d,
+                'swing':  mul(n, sign(side)) if side else None,                           # side of the swing
+                'hinge':  mul(d, hinge_side) if kind == 'door' and hinge_side else None}  # hinge jamb from the center
+
+    def whole():
+        if len(windows) > len(doors):
+            return [opening('window', ta, tb, 0)]
+        if (doors or hinge or leaves) and length <= MAX_DOOR:
+            return [opening('door', ta, tb, max(leaves, key=lambda l: l[1] - l[0])[2] if leaves else hinge)]
+        return None
+
+    # Doors: [start, end, hinge side of the widest leaf, its width, hinge side of the last leaf]
+    groups = []
+    for s0, s1, side in sorted(set(leaves)):
+        g = groups[-1] if groups else None
+        if g and s0 < g[1] - (s1 - s0) / 2.0:
+            continue                                       # the same leaf drawn twice
+        if g and g[4] == -1 and side == 1 and s0 - g[1] <= 2 * JAMB_TOL:
+            if s1 - s0 > g[3]:
+                g[2], g[3] = side, s1 - s0
+            g[1], g[4] = s1, side                          # tips meet: double door
+        else:
+            groups.append([s0, s1, side, s1 - s0, side])
+    if not groups:
+        return whole()
+
+    out, cur = [], ta
+    for i, g in enumerate(groups):
+        g0, g1 = g[0] - DOOR_FRAME, g[1] + DOOR_FRAME
+        if g0 - cur >= SIDE_MIN:
+            out.append((cur, g0, None))
+            cur = g0
+        if i + 1 < len(groups):
+            nxt = groups[i + 1][0] - DOOR_FRAME
+            end = g1 if nxt - g1 >= SIDE_MIN else (g[1] + groups[i + 1][0]) / 2.0
+        else:
+            end = g1 if tb - g1 >= SIDE_MIN else tb
+        out.append((cur, min(end, tb), g))
+        cur = min(end, tb)
+    if tb - cur >= SIDE_MIN:
+        out.append((cur, tb, None))
+
+    found = []
+    for t0, t1, g in out:
+        if g:
+            if t1 - t0 > MAX_DOOR:
+                return whole()
+            found.append(opening('door', t0, t1, g[2]))
+            continue
+        nw = sum(1 for t in windows if t0 <= t <= t1)
+        nd = sum(1 for t in doors if t0 + JAMB_TOL <= t <= t1 - JAMB_TOL)
+        if not nw and not nd:
+            return whole()                                 # nothing drawn beside the door: one opening
+        found.append(opening('window' if nw > nd else 'door', t0, t1, 0))
+    return found
 
 
 # ── Walls from parallel lines ─────────────────────
@@ -373,6 +463,62 @@ def pattern_lines(rows, active, max_w):
     return out
 
 
+def same_run(r, s):
+    """How much two parallel lines run together: the length they share, reduced
+    when one goes on much further than the other (x overlap / union of their
+    extents). Long for the lines of one wall, ~0 for a line that just passes by."""
+    union = max(r[2], s[2]) - min(r[1], s[1])
+    overlap = max(0.0, min(r[2], s[2]) - max(r[1], s[1]))
+    return overlap * overlap / union if union > 0 else 0.0
+
+
+def split_walls(rows, lines, max_w):
+    """Walls of a stretch. lines = indexes of the rows present, sorted by offset
+    -> [(i, j)]: positions in lines of the two outer lines of each wall.
+    A wall = lines i..j with a width between MIN_WIDTH and max_w, drawn as:
+    - a chain of lines closer than MIN_WIDTH (all its layers: boards, core...), or
+    - two faces separated by one gap >= MIN_WIDTH (the core), each face being one
+      line or a few lines within MIN_WIDTH (finish / double contour) with no other
+      line close behind (the lines left of a chain are not a face: inside of a
+      shaft between two layered walls).
+    Among all the ways of splitting the lines, the one that explains the most
+    lines with lines that run together is kept: a line left over from another
+    wall (mitred corner, junction) is not taken as a face, and two walls drawn
+    against each other are not merged in a thick one."""
+    n = len(lines)
+    off = [rows[i][0] for i in lines]
+    best = [(0.0, None)] * (n + 1)                         # (score, j of the wall starting at k)
+    for k in range(n - 1, -1, -1):
+        top = (best[k + 1][0], None)                       # line k is not part of a wall
+        core = None                                        # first line after the core gap
+        for j in range(k + 1, n):
+            if off[j] - off[j - 1] >= MIN_WIDTH:
+                if core is not None or off[j - 1] - off[k] >= MIN_WIDTH:
+                    break                                  # 2 gaps / the first face is a wall itself
+                core = j
+            width = off[j] - off[k]
+            if width > max_w or (core is not None and off[j] - off[core] >= MIN_WIDTH):
+                break
+            if width < MIN_WIDTH:
+                continue
+            if core is not None and ((k > 0 and off[k] - off[k - 1] < MIN_WIDTH) or
+                                     (j < n - 1 and off[j + 1] - off[j] < MIN_WIDTH)):
+                continue                                   # a face = all its lines, not the rest of a chain
+            score = (j - k + 1) * same_run(rows[lines[k]], rows[lines[j]]) - 1e-6 * width + best[j + 1][0]
+            if score > top[0]:
+                top = (score, j)
+        best[k] = top
+    out, k = [], 0
+    while k < n:
+        j = best[k][1]
+        if j is None:
+            k += 1
+        else:
+            out.append((k, j))
+            k = j + 1
+    return out
+
+
 def normalize_bands(pieces):
     """Pieces of one wall measured with a slightly different width (a line of the
     inner layers is missing on a stretch: jambs, door frames...) get the offset /
@@ -414,13 +560,52 @@ def normalize_bands(pieces):
     return out
 
 
+def absorb_ends(pieces):
+    """Layered walls are mitred at the corners: the inner lines stop before the
+    outer ones, so the last bit of the wall is measured narrower. A short run of
+    pieces (not longer than the width of the wall) that touches a wider and longer
+    run and lies in its band gets its offset / width."""
+    order = sorted(range(len(pieces)), key=lambda i: (pieces[i][3], offset_key(pieces[i][0]), pieces[i][1]))
+    runs = []                                              # [off, t0, t1, w, [pieces]]
+    for i in order:
+        p = pieces[i]
+        if runs and runs[-1][3] == p[3] and abs(runs[-1][0] - p[0]) <= OFF_TOL and p[1] - runs[-1][2] <= POINT_TOL:
+            runs[-1][2] = max(runs[-1][2], p[2])
+            runs[-1][4].append(i)
+        else:
+            runs.append([p[0], p[1], p[2], p[3], [i]])
+    out = list(pieces)
+    for r in runs:
+        wall = None
+        for q in runs:
+            if (q[3] > r[3] and r[2] - r[1] <= q[3] * MM and q[2] - q[1] > r[2] - r[1]
+                    and (abs(q[1] - r[2]) <= POINT_TOL or abs(r[1] - q[2]) <= POINT_TOL)
+                    and abs(q[0] - r[0]) <= (q[3] - r[3]) * MM / 2.0 + OFF_TOL
+                    and (wall is None or q[3] > wall[3])):
+                wall = q
+        if wall:
+            for i in r[4]:
+                out[i] = (wall[0], pieces[i][1], pieces[i][2], wall[3])
+    return out
+
+
+def lines_inside(by_off, off, half, t0, t1):
+    """True if a line runs inside the band (not on its faces) along a good part of t0-t1."""
+    for key in range(offset_key(off - half) + 1, offset_key(off + half)):
+        for r in by_off.get(key, ()):
+            if abs(r[0] - off) < half - OFF_TOL and min(r[2], t1) - max(r[1], t0) > (t1 - t0) / 4.0:
+                return True
+    return False
+
+
 def merge_pieces(pieces, rows, max_w, d, index):
     """Joins the pieces of the same wall -> [(off, t0, t1, w, [openings])].
     A gap is bridged when one of the faces goes on (T junction: the other face
-    is cut by the branch) or when a door / window is drawn in it. A gap without
-    anything (passage) stays open."""
+    is cut by the branch) or when a door / window is drawn in it and no wall line
+    runs inside the band (the 'gap' between two bits of a shaft / closet is not an
+    opening: its walls go on there). A gap without anything (passage) stays open."""
     out, by_off = [], rows_by_offset(rows)
-    for p in sorted(normalize_bands(pieces), key=lambda p: (p[3], offset_key(p[0]), p[1])):
+    for p in sorted(absorb_ends(normalize_bands(pieces)), key=lambda p: (p[3], offset_key(p[0]), p[1])):
         if out:
             off, t0, t1, w, ops = out[-1]
             if p[3] == w and abs(p[0] - off) <= OFF_TOL:
@@ -428,10 +613,10 @@ def merge_pieces(pieces, rows, max_w, d, index):
                 half = w * MM / 2.0
                 bridge = gap <= POINT_TOL or (gap <= max_w and (face_spans(by_off, off - half, t1, p[1]) or
                                                                 face_spans(by_off, off + half, t1, p[1])))
-                if not bridge and gap <= MAX_OPENING:
-                    op = find_opening(index, d, off, w, t1, p[1])
-                    if op:
-                        ops.append(op)
+                if not bridge and gap <= MAX_OPENING and not lines_inside(by_off, off, half, t1, p[1]):
+                    found = find_openings(index, d, off, w, t1, p[1])
+                    if found is not None:
+                        ops.extend(found)
                         bridge = True
                 if bridge:
                     out[-1] = (off, t0, max(t1, p[2]), w, ops)
@@ -440,54 +625,157 @@ def merge_pieces(pieces, rows, max_w, d, index):
     return out
 
 
+# ── Walls drawn twice ─────────────────────────────
+class SegGrid(object):
+    """Grid of the boxes of segments -> the ones near another segment."""
+    CELL = 10.0
+
+    def __init__(self):
+        self.cells = {}
+
+    def keys(self, a, b, r):
+        c = self.CELL
+        for i in range(int(math.floor((min(a[0], b[0]) - r) / c)), int(math.floor((max(a[0], b[0]) + r) / c)) + 1):
+            for j in range(int(math.floor((min(a[1], b[1]) - r) / c)), int(math.floor((max(a[1], b[1]) + r) / c)) + 1):
+                yield (i, j)
+
+    def add(self, item, a, b, r):
+        for key in self.keys(a, b, r):
+            self.cells.setdefault(key, []).append(item)
+
+    def near(self, a, b, r=0.0):
+        out = set()
+        for key in self.keys(a, b, r):
+            out.update(self.cells.get(key, ()))
+        return out
+
+
+def covered_spans(seg, half, walls, grid, tol=OFF_TOL):
+    """Parts of seg lying in the band of a wall -> [(s0, s1, wall index, parallel)],
+    s = distance from the start of seg. All of it when both ends are in the band
+    (crossing it or along it); the part along a parallel wall when the band of
+    seg (half = its half width, 0 for a line) is inside the band of the wall
+    (+ tol)."""
+    a, b = seg
+    length = dist(a, b)
+    d = unit(sub(b, a))
+    out = []
+    for k in grid.near(a, b):
+        wall = walls[k]
+        w0, w1 = wall[0]
+        u = unit(sub(w1, w0))
+        hw, wl = wall[1] * MM / 2.0, dist(w0, w1)
+        ta, tb = dot(sub(a, w0), u), dot(sub(b, w0), u)
+        oa, ob = abs(cross(u, sub(a, w0))), abs(cross(u, sub(b, w0)))
+        parallel = abs(cross(d, u)) < PARALLEL_SIN
+        if max(oa, ob) + (half if parallel else 0.0) > hw + tol:
+            continue
+        if parallel:
+            s0, s1 = sorted((dot(sub(w0, a), d), dot(sub(w1, a), d)))
+            s0, s1 = max(s0, 0.0), min(s1, length)
+            if s1 - s0 > POINT_TOL:
+                out.append((s0, s1, k, True))
+        elif min(ta, tb) >= -tol and max(ta, tb) <= wl + tol:
+            out.append((0.0, length, k, False))
+    return out
+
+
+def uncovered(seg, spans):
+    """Pieces of seg left once the spans [(s0, s1, ...)] are taken out -> [(s0, s1)]."""
+    out, s = [], 0.0
+    for sp in sorted(spans):
+        if sp[0] - s > POINT_TOL:
+            out.append((s, sp[0]))
+        s = max(s, sp[1])
+    length = seg_len(seg)
+    if length - s > POINT_TOL:
+        out.append((s, length))
+    return out
+
+
+def drop_covered(walls, singles):
+    """walls = [(center seg, width mm, [openings])]. Removes what is found twice:
+    - a wall that crosses inside the band of another one (the two jambs of a pier
+      between two openings paired as a wall, the zigzag of a folding partition...)
+    - the part of a wall that runs in the band of a wider / longer one (the same
+      wall drawn on two layers, its core on another layer). Its doors / windows
+      go to the wall that stays.
+    - the part of a single line that runs in the band of a wall or closer than
+      MIN_WIDTH to it (a face drawn again on another layer, a finish line).
+    The wider (then longer) wall stays. A wall less than twice as long as wide
+    does not remove anything: when it is wrong (inside of a shaft) the walls in
+    it are the right ones."""
+    order = sorted(range(len(walls)), key=lambda k: (-walls[k][1], -seg_len(walls[k][0])))
+    kept, grid = [], SegGrid()
+    for k in order:
+        seg, w, ops = walls[k]
+        a, d = seg[0], unit(sub(seg[1], seg[0]))
+        spans = covered_spans(seg, w * MM / 2.0, kept, grid)
+        for s0, s1 in (uncovered(seg, spans) if spans else [(0.0, seg_len(seg))]):
+            if s1 - s0 < w * MM:
+                continue                                   # what sticks out of the other wall is not a wall
+            piece = ((add(a, mul(d, s0)), add(a, mul(d, s1))), w,
+                     [op for op in ops if s0 <= dot(sub(op['center'], a), d) <= s1])
+            if s1 - s0 >= 2.0 * w * MM:
+                grid.add(len(kept), piece[0][0], piece[0][1], w * MM / 2.0 + OFF_TOL)
+            kept.append(piece)
+        for s0, s1, j, parallel in spans:
+            if not parallel:
+                continue
+            for op in ops:                                 # openings of the part removed
+                if (s0 <= dot(sub(op['center'], a), d) <= s1 and
+                        not any(dist(op['center'], o['center']) < (op['width'] + o['width']) * MM / 2.0
+                                for o in kept[j][2])):
+                    kept[j][2].append(op)
+    grid = SegGrid()
+    for k, wall in enumerate(kept):
+        grid.add(k, wall[0][0], wall[0][1], wall[1] * MM / 2.0 + MIN_WIDTH)
+    lines = []
+    for seg in singles:
+        a, d = seg[0], unit(sub(seg[1], seg[0]))
+        spans = covered_spans(seg, 0.0, kept, grid, MIN_WIDTH)
+        lines += [(add(a, mul(d, s0)), add(a, mul(d, s1)))
+                  for s0, s1 in (uncovered(seg, spans) if spans else [(0.0, seg_len(seg))])]
+    return kept, lines
+
+
 def wall_pieces(segs, max_w, index, progress):
     """-> ([(center seg, width mm, [openings])], [lines never paired]).
     Along the path the set of lines changes (junctions, openings): the walls are
-    found on each stretch where the same lines are present, pairing the lines
-    two by two in the order of their offset. Progress: 1 unit per line.
+    found on each stretch where the same lines are present (split_walls).
+    Progress: 1 unit per line.
     Bits shorter than MIN_WIDTH are ignored (segments of hatch / insulation
     polylines): a face of a wall is never that short."""
     segs = [sg for sg in segs if seg_len(sg) >= MIN_WIDTH]
     walls, singles = [], []
-    for d, group in parallel_groups(segs):
-        rows = sorted(to_frame(d, s) for s in group)
-        paired = [False] * len(rows)
-        for comp in components(rows, max_w):
-            crow = [rows[i] for i in comp]
-            pieces = []
-            for u, v, active in stretches(rows, comp):
-                hatch = pattern_lines(rows, active, max_w)
-                for i in hatch:
-                    paired[i] = True                       # not single lines either
-                # faces = [[line, double contour lines...], ...] sorted by offset
-                faces = []
-                for i in active:
-                    if i in hatch:
-                        continue
-                    if faces and rows[i][0] - rows[faces[-1][0]][0] < MIN_WIDTH:
-                        faces[-1].append(i)
-                    else:
-                        faces.append([i])
-                k = 0
-                while k < len(faces) - 1:
-                    # outer lines of the two faces (double contour: the wall is the whole band)
-                    a, b = rows[faces[k][0]][0], rows[faces[k + 1][-1]][0]
-                    # both faces on the same layer: lines of two layers side by side
-                    # (load-bearing wall + partition, wall + cladding) are not one wall
-                    same_layer = (set(rows[i][3] for i in faces[k]) &
-                                  set(rows[i][3] for i in faces[k + 1]))
-                    if b - a <= max_w and same_layer:
+    by_layer = {}
+    for sg in segs:
+        by_layer.setdefault(sg[2], []).append(sg)
+    # Each layer is solved on its own: lines of two layers side by side (load-bearing
+    # wall + partition, wall + cladding) are never the two faces of one wall
+    for layer_segs in by_layer.values():
+        for d, group in parallel_groups(layer_segs):
+            rows = sorted(to_frame(d, s) for s in group)
+            paired = [False] * len(rows)
+            for comp in components(rows, max_w):
+                crow = [rows[i] for i in comp]
+                pieces = []
+                for u, v, active in stretches(rows, comp):
+                    hatch = pattern_lines(rows, active, max_w)
+                    for i in hatch:
+                        paired[i] = True                   # not single lines either
+                    lines = [i for i in active if i not in hatch]
+                    for i, j in split_walls(rows, lines, max_w):
+                        a, b = rows[lines[i]][0], rows[lines[j]][0]
                         pieces.append(((a + b) / 2.0, u, v, round_width(b - a)))
-                        for i in faces[k] + faces[k + 1]:
-                            paired[i] = True
-                        k += 2
-                    else:
-                        k += 1
-            for off, t0, t1, w, ops in merge_pieces(pieces, crow, max_w, d, index):
-                if t1 - t0 >= w * MM:                      # shorter: a jamb next to another wall
-                    walls.append((from_frame(d, off, t0, t1), w, ops))
-            progress.advance(len(comp))
-        singles += [from_frame(d, *rows[i][:3]) for i in range(len(rows)) if not paired[i]]
+                        for x in lines[i:j + 1]:
+                            paired[x] = True
+                for off, t0, t1, w, ops in merge_pieces(pieces, crow, max_w, d, index):
+                    if t1 - t0 >= w * MM:                  # shorter: a jamb next to another wall
+                        walls.append((from_frame(d, off, t0, t1), w, ops))
+                progress.advance(len(comp))
+            singles += [from_frame(d, *rows[i][:3]) for i in range(len(rows)) if not paired[i]]
+    walls, singles = drop_covered(walls, singles)
 
     # Drawn with double lines -> the short single lines are end caps, jambs...
     if walls:
@@ -496,10 +784,12 @@ def wall_pieces(segs, max_w, index, progress):
 
 
 def snap_ends(walls, progress):
-    """walls = [[p0, p1, width mm, openings], ...]. A free end is extended (or trimmed
-    a bit) to the center line of the wall it runs into: the two faces drawn in the
-    DWG stop at the face of the other wall, Revit joins walls at their center line."""
-    count = {}
+    """walls = [[p0, p1, width mm, openings], ...]. A free end in the band of another
+    wall is moved to its center line: the two faces drawn in the DWG stop at the
+    face of the other wall (T junction: extended) or go on to its outer face (L
+    corner: trimmed), Revit joins walls at their center line.
+    -> indexes of the walls that touch another one."""
+    count, joined = {}, set()
     for w in walls:
         for p in w[:2]:
             count[point_key(p)] = count.get(point_key(p), 0) + 1
@@ -516,10 +806,13 @@ def snap_ends(walls, progress):
             for j in range(cell(box[1]), cell(box[3]) + 1):
                 grid.setdefault((i, j), []).append(k)
 
-    for wall in walls:
+    for index, wall in enumerate(walls):
         for e in (0, 1):
             p, q = wall[e], wall[1 - e]
-            if count[point_key(p)] > 1 or seg_len((p, q)) < POINT_TOL:
+            if seg_len((p, q)) < POINT_TOL:
+                continue
+            if count[point_key(p)] > 1:
+                joined.add(index)
                 continue                                   # already joined (center line drawings)
             d = unit(sub(p, q))                            # outwards
             margin = wall[2] * MM / 2.0 + SNAP_TOL
@@ -543,12 +836,18 @@ def snap_ends(walls, progress):
                 w0 = sub(other[0], p)
                 s = cross(w0, u) / den                     # along d from p
                 t = cross(w0, d) / den                     # along the other wall
-                if (-SNAP_TOL <= s <= other[2] * MM / 2.0 + SNAP_TOL and -margin <= t <= L + margin
-                        and (best is None or abs(s) < abs(best[0]))):
-                    best = (s, add(p, mul(d, s)))
-            if best and abs(best[0]) > POINT_TOL:
-                wall[e] = best[1]
+                reach = other[2] * MM / 2.0 + SNAP_TOL      # the end is in the band of the other wall
+                side = max(margin, reach)                  # ... or just past its end (L corner)
+                # several walls at a node: the widest one is the main wall, the others run into it
+                if (abs(s) <= reach and -side <= t <= L + side
+                        and (best is None or (other[2], -abs(s)) > (best[2], -abs(best[0])))):
+                    best = (s, add(p, mul(d, s)), other[2], k)
+            if best:
+                joined.update((index, best[3]))
+                if abs(best[0]) > POINT_TOL:
+                    wall[e] = best[1]
         progress.advance()
+    return joined
 
 
 # ── DWG ───────────────────────────────────────────
@@ -1142,8 +1441,12 @@ with forms.ProgressBar(title="Walls From DWG - Center lines... {value}%", cancel
         double, singles = wall_pieces(segs, s['max_width'], index, progress)
         walls = [[sg[0], sg[1], w, ops] for sg, w, ops in double] + [[sg[0], sg[1], s['width'], []] for sg in singles]
         progress.phase(7, 10, len(walls))
-        snap_ends(walls, progress)
-        walls = [w for w in walls if seg_len(w[:2]) >= MIN_SEG]
+        joined = snap_ends(walls, progress)
+        # A block less than twice as long as wide that touches no wall is a column / pier
+        blocks = set(k for k, w in enumerate(walls) if k not in joined and seg_len(w[:2]) < BLOCK_RATIO * w[2] * MM)
+        if blocks:
+            output.print_md("- {} short thick blocks that touch no wall (columns / piers): not created.".format(len(blocks)))
+        walls = [w for k, w in enumerate(walls) if k not in blocks and seg_len(w[:2]) >= MIN_SEG]
         if not walls:
             output.print_md("- **No walls found** in these layers.")
 

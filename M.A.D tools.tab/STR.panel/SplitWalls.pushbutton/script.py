@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 __title__   = "Split\nWalls"
-__doc__     = """Version = 2.5
-Date    = 13.11.2026
+__doc__     = """Version = 2.6
+Date    = 14.11.2026
 ________________________________________________________________
 Description:
 
@@ -47,6 +47,20 @@ How-To:
 2. Review the report.
 ________________________________________________________________
 Last Updates:
+- [14.11.2026] v2.6 Wall ends checked on the real geometry:
+                    - the footprint of every wall (split, or next to
+                      a split wall) is measured before splitting; at
+                      the end each wall end must be where it was;
+                    - walls ending against a split wall (T) are
+                      joined to the layer that has the face they
+                      ended against;
+                    - an end that Revit cannot join without moving
+                      it is left unjoined, exactly where it was (it
+                      used to stay at the old wall centerline);
+                    - checked again after Revit joins the walls on
+                      commit;
+                    - joins of stacked walls released on the stacked
+                      wall (its members follow it).
 - [13.11.2026] v2.5 No wall moves anymore:
                     - layers measured on the real exterior face (the
                       location curve is the wall centerline even
@@ -113,6 +127,7 @@ FT_TO_CM  = 30.48
 MIN_LAYER = 5 / FT_TO_CM  # feet (5 cm)  thinner layers (plaster, membranes...) are ignored
 TOL_Z     = 0.033       # feet (~1 cm)  vertical tolerance for stacked members / inserts
 TOL_DIM   = 0.0003      # feet (~0.1 mm) width tolerance to reuse a layer type
+TOL_END   = 0.0033      # feet (~1 mm)  a wall end further than this from where it was has moved
 
 # Instance parameters not copied when a door / window is recreated (derived from others)
 SKIP_PARAMS = set([BuiltInParameter.INSTANCE_HEAD_HEIGHT_PARAM])
@@ -261,69 +276,454 @@ def move_to_curve(wall, target, normal):
         wall.Location.Curve = target.CreateTransformed(Transform.CreateTranslation(XYZ(0, 0, dz)))
 
 
+# ── Real geometry (footprint) ─────────────────────────
+def plan_segments(wall):
+    """Outline of the horizontal faces of the wall solids as segments [(XYZ, XYZ)]: seen in plan they draw
+    its real footprint, with the extensions / trims of its joins (the location curve only goes up to the
+    join point). Taken from the loops of the faces, which are closed: Solid.Edges does not return the
+    edges of the wall ends that are joined to another wall."""
+    segs = []
+    geom = wall.get_Geometry(Options())
+    if geom is None:
+        return segs
+    for obj in geom:
+        if isinstance(obj, Solid) and obj.Volume > 1e-9:
+            for face in obj.Faces:
+                if isinstance(face, PlanarFace) and abs(face.FaceNormal.Z) > 0.5:
+                    for loop in face.GetEdgesAsCurveLoops():
+                        for edge in loop:
+                            pts = list(edge.Tessellate())
+                            segs += [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    return segs
+
+
+def reach(segs, origin, d, n, c):
+    """(min, max) distance along d - from origin - covered by the footprint on the line parallel to d
+    at distance c towards n: where the wall really starts and ends on that line. None if it misses."""
+    low, high = None, None
+    for a, b in segs:
+        ca, cb = (a - origin).DotProduct(n) - c, (b - origin).DotProduct(n) - c
+        if (ca > 0) == (cb > 0):
+            continue
+        t = ca / (ca - cb)
+        s = (a - origin).DotProduct(d) * (1 - t) + (b - origin).DotProduct(d) * t
+        low  = s if low is None else min(low, s)
+        high = s if high is None else max(high, s)
+    return None if low is None else (low, high)
+
+
+def footprints(wall):
+    """{wall id: plan_segments} of the wall, or of each member of a stacked wall."""
+    members = [doc.GetElement(i) for i in wall.GetStackedWallMemberIds()] if wall.IsStackedWall else [wall]
+    return dict((m.Id.ToString(), plan_segments(m)) for m in members)
+
+
+# ── Joins ─────────────────────────────────────────────
 # Wall ends whose join was disallowed while splitting: {wall id: (wall, set of ends)}
 FREED = {}
+# Layer walls: {wall id: {"wall", "origin", "d", "n", "c", "reach"}} where the footprint of the original
+# wall started / ended on the centerline of the layer (line at distance c of origin, see reach)
+LAYER_ENDS = {}
+# Ends of the walls NOT split around the split walls: {(wall id, end): {...}} where they really ended
+# before splitting (see track_end)
+NEIGHBORS = {}
+# Ends of the layer walls set by fix_corners: {(wall id, end)}
+CLEANED = set()
+# plan_segments of the walls measured before splitting: {wall id: segments} (emptied once they are measured)
+SEGMENTS = {}
 
-def free_ends(wall):
+
+def was_allowed(wall, end):
+    """True if the join of that end was allowed before the script disallowed it."""
+    return WallUtils.IsWallJoinAllowedAtEnd(wall, end) or end in FREED.get(wall.Id.ToString(), (None, ()))[1]
+
+
+def free_ends(wall, source=None, curve=None):
     """Disallows the joins at both ends of the wall, so changing its type / location line or moving it
-    does not drag the walls joined to it. They are allowed again by restore_joins (at the very end)."""
+    does not drag the walls joined to it. They are allowed again by restore_joins (at the very end),
+    except the ends that were already disallowed in 'source' (the wall it replaces, 'curve' = its curve
+    if it has not been regenerated yet)."""
     for end in (0, 1):
-        if WallUtils.IsWallJoinAllowedAtEnd(wall, end):
-            WallUtils.DisallowWallJoinAtEnd(wall, end)
+        if source is None:
+            restore = WallUtils.IsWallJoinAllowedAtEnd(wall, end)
+        else:
+            point   = (wall.Location.Curve if curve is None else curve).GetEndPoint(end)
+            restore = was_allowed(source, near_end(source.Location.Curve, point))
+        WallUtils.DisallowWallJoinAtEnd(wall, end)
+        if restore:
             FREED.setdefault(wall.Id.ToString(), (wall, set()))[1].add(end)
 
 
-def free_neighbor_ends(wall):
-    """Disallows the joins of the OTHER walls whose ends are joined to the wall (T joins against its side,
-    L corners...): those ends follow the location line of the wall when it changes, dragging the walls."""
-    hosts = [wall] + ([doc.GetElement(i) for i in wall.GetStackedWallMemberIds()] if wall.IsStackedWall else [])
-    host_ids = set(h.Id.ToString() for h in hosts)
+def parts_of(wall):
+    """The walls that have the geometry and the joins: the members of a stacked wall, or the wall."""
+    return [doc.GetElement(i) for i in wall.GetStackedWallMemberIds()] if wall.IsStackedWall else [wall]
+
+
+def owner_end(wall, end):
+    """(wall, end), a member of a stacked wall being replaced by its stacked wall: the joins of a stacked
+    wall are handled on it (its members follow it)."""
+    if wall.IsStackedWallMember:
+        owner = doc.GetElement(wall.StackedWallOwnerId)
+        return owner, near_end(owner.Location.Curve, wall.Location.Curve.GetEndPoint(end))
+    return wall, end
+
+
+def walls_near(wall):
+    """Basic walls and members of stacked walls (not the stacked walls) around the wall, itself excluded."""
+    host_ids = set(p.Id.ToString() for p in parts_of(wall))
+    host_ids.add(wall.Id.ToString())
     bb = wall.get_BoundingBox(None)
     if bb is None:
-        return
+        return [], host_ids
     pad = XYZ(1, 1, 1)
     near = FilteredElementCollector(doc).OfClass(Wall).WherePasses(
         BoundingBoxIntersectsFilter(Outline(bb.Min - pad, bb.Max + pad)))
+    return [w for w in near if w.Id.ToString() not in host_ids and not w.IsStackedWall
+            and isinstance(w.Location, LocationCurve)], host_ids
+
+
+def neighbor_ends(wall):
+    """[(other wall, end)]: ends of the OTHER walls joined to the wall (T joins against its side, L corners,
+    walls in line...)."""
+    near, host_ids = walls_near(wall)
+    result, seen = [], set()
     for other in near:
-        if other.Id.ToString() in host_ids or not isinstance(other.Location, LocationCurve):
-            continue
         for end in (0, 1):
             joined = [e.Id.ToString() for e in other.Location.get_ElementsAtJoin(end)]
-            if host_ids.intersection(joined) and WallUtils.IsWallJoinAllowedAtEnd(other, end):
-                WallUtils.DisallowWallJoinAtEnd(other, end)
-                FREED.setdefault(other.Id.ToString(), (other, set()))[1].add(end)
+            if not host_ids.intersection(joined):
+                continue
+            target, target_end = owner_end(other, end)
+            key = (target.Id.ToString(), target_end)
+            if key[0] not in host_ids and key not in seen:
+                seen.add(key)
+                result.append((target, target_end))
+    return result
+
+
+def ends_joined_at(wall, end):
+    """[(other wall, its end)]: the ends of other walls joined at that end of the wall."""
+    ids = set(p.Id.ToString() for p in parts_of(wall))
+    ids.add(wall.Id.ToString())
+    point = wall.Location.Curve.GetEndPoint(end)
+    result, seen = [], set()
+    for part in parts_of(wall):
+        for e in part.Location.get_ElementsAtJoin(near_end(part.Location.Curve, point)):
+            if not isinstance(e, Wall) or e.Id.ToString() in ids or not isinstance(e.Location, LocationCurve):
+                continue
+            for k in (0, 1):
+                if ids.intersection(x.Id.ToString() for x in e.Location.get_ElementsAtJoin(k)):
+                    other, other_end = owner_end(e, k)
+                    key = (other.Id.ToString(), other_end)
+                    if key[0] not in ids and key not in seen:
+                        seen.add(key)
+                        result.append((other, other_end))
+    return result
+
+
+def free_neighbor_ends(wall):
+    """Disallows the joins of the OTHER walls whose ends are joined to the wall: those ends follow the
+    location line of the wall when it changes, dragging the walls."""
+    for other, end in neighbor_ends(wall):
+        if WallUtils.IsWallJoinAllowedAtEnd(other, end):
+            WallUtils.DisallowWallJoinAtEnd(other, end)
+            FREED.setdefault(other.Id.ToString(), (other, set()))[1].add(end)
+
+
+def track_end(wall, end, selected, slide=False):
+    """Measures where that end of a wall that is not split really is (NEIGHBORS).
+    Basic walls: on their centerline and next to both faces (a mitred end is not square).
+    Stacked walls: on the centerline of each member.
+    slide: the end is joined to a split wall (it may be moved onto a layer, see slide_to_layer)."""
+    key   = (wall.Id.ToString(), end)
+    curve = wall.Location.Curve
+    if key in NEIGHBORS:
+        NEIGHBORS[key]["slide"] = NEIGHBORS[key]["slide"] or slide
+        return
+    if key[0] in selected or not isinstance(curve, Line):
+        return
+    origin, d = curve.GetEndPoint(0), curve.Direction
+    n = XYZ.BasisZ.CrossProduct(d)
+    if wall.IsStackedWall:
+        parts   = parts_of(wall)
+        offsets = [[flat(p.Location.Curve.GetEndPoint(0) - origin).DotProduct(n)] for p in parts]
+    else:
+        half = wall.Width / 2.0 - 3 * TOL_END
+        parts, offsets = [wall], [[0.0, half, -half]]
+    lines = []                                              # (part, line offset, where it ended)
+    for part, part_offsets in zip(parts, offsets):
+        pid = part.Id.ToString()
+        if pid not in SEGMENTS:
+            SEGMENTS[pid] = plan_segments(part)
+        segs = SEGMENTS[pid]
+        for c in part_offsets:
+            r = reach(segs, origin, d, n, c)
+            if r is not None:
+                lines.append((part, c, r[end]))
+    if lines:
+        NEIGHBORS[key] = {"wall": wall, "end": end, "points": (origin, curve.GetEndPoint(1)), "d": d,
+                          "n": n, "lines": lines, "stacked": wall.IsStackedWall, "slide": slide}
+
+
+def track_neighbors(wall, selected):
+    """Measures - before anything is modified - where the walls around the wall really end:
+    - both ends of every wall next to it, joined to it or not: a wall that only touched it can be joined
+      by Revit to one of the new layer walls, and the wall a split wall ended against changes with it;
+    - the ends joined to the other end of the walls joined to it: changing the location line of a wall
+      makes Revit work out the joins of both its ends again."""
+    joined  = neighbor_ends(wall)
+    sliding = set((other.Id.ToString(), end) for other, end in joined)
+    near, host_ids = walls_near(wall)
+    for other in near:
+        other = owner_end(other, 0)[0]
+        if other.Id.ToString() not in host_ids:
+            for end in (0, 1):
+                track_end(other, end, selected, (other.Id.ToString(), end) in sliding)
+    for other, end in joined:
+        for third, third_end in ends_joined_at(other, 1 - end):
+            track_end(third, third_end, selected)
+
+
+def set_line(wall, points):
+    """Moves the location line of the wall to the plan position 'points' (elevation and direction kept).
+    Returns False if nothing is changed."""
+    curve = wall.Location.Curve
+    pts   = [XYZ(p.X, p.Y, curve.GetEndPoint(i).Z) for i, p in enumerate(points)]
+    if (pts[1] - pts[0]).DotProduct(curve.Direction) < 0.03:                # too short, or turned around
+        return False
+    if all(pts[i].IsAlmostEqualTo(curve.GetEndPoint(i), 1e-6) for i in (0, 1)):
+        return False
+    wall.Location.Curve = Line.CreateBound(pts[0], pts[1])
+    return True
+
+
+def set_end(wall, end, point):
+    """Moves one end of the location line of the wall."""
+    curve = wall.Location.Curve
+    pts   = [curve.GetEndPoint(0), curve.GetEndPoint(1)]
+    pts[end] = point
+    return set_line(wall, pts)
+
+
+def track_layer(wall, segs, curve, normal, c):
+    """Registers where the original wall (footprint 'segs', location 'curve') started and ended on the
+    centerline of the layer wall, at distance c of the curve towards 'normal' (LAYER_ENDS)."""
+    if not segs or not isinstance(curve, Line):
+        return
+    origin, d = curve.GetEndPoint(0), curve.Direction
+    r = reach(segs, origin, d, normal, c)
+    if r is not None:
+        LAYER_ENDS[wall.Id.ToString()] = {"wall": wall, "origin": origin, "d": d, "n": normal, "c": c,
+                                          "reach": r}
 
 
 def same_curve(a, b):
     return all(a.GetEndPoint(i).IsAlmostEqualTo(b.GetEndPoint(i), 1e-6) for i in (0, 1))
 
 
-def restore_joins():
-    """Allows again the joins disallowed while splitting (except the ends cleaned up by fix_corners).
-    Joining snaps a wall end to the location line of the other wall: every wall Revit moves is put back,
-    and if it still does not stay in place its end is left unjoined. Returns the ends left unjoined."""
-    items = []
-    for wall, ends in FREED.values():
-        if wall.IsValidObject and ends:             # not created in a rolled back transaction
-            items.append((wall, ends, wall.Location.Curve.Clone()))
-    FREED.clear()
-    for wall, ends, _ in items:
-        for end in ends:
-            if not WallUtils.IsWallJoinAllowedAtEnd(wall, end):
-                WallUtils.AllowWallJoinAtEnd(wall, end)
-    doc.Regenerate()
+def end_moved(shift):
+    """True if a wall end counts as moved. shift (feet) = where the wall really ends now - where it ended
+    before splitting, measured along the wall: > 0 the wall is longer at that end, < 0 it is shorter.
+    Strict on purpose, in both directions: a wall that ended against a thin layer that is not split (1 cm
+    of plaster...) is NOT stretched across the gap that layer leaves to reach the next layer and stay
+    joined; it is left unjoined, exactly where it was. To allow that growth instead, accept
+    0 < shift < MIN_LAYER here (a wall must never be allowed to get shorter)."""
+    return abs(shift) > TOL_END
 
-    moved = [(w, ends, curve) for w, ends, curve in items if not same_curve(w.Location.Curve, curve)]
-    for wall, _, curve in moved:
-        wall.Location.Curve = curve
+
+def slide_to_layer(nb, layers):
+    """T join: the neighbor ended against a face of the split wall. Its end point is moved, along its own
+    axis, onto the centerline of the layer wall that now has that face: Revit joins it to the layer its
+    end point is in, and trims it at the face of that layer - where it ended before.
+    (Left at the old wall centerline it would be joined to whatever layer is there, e.g. the insulation.)"""
+    wall, end = nb["wall"], nb["end"]
+    if nb["stacked"]:
+        return
+    d    = nb["d"]
+    out  = d if end == 1 else d.Negate()                    # leaving the wall through that end
+    face = nb["points"][0] + d.Multiply(nb["lines"][0][2])  # where its centerline really ended
+    bb   = wall.get_BoundingBox(None)
+    found = None
+    for info in layers:
+        line = info["line"]
+        if abs(line.Direction.DotProduct(d)) > 0.94:        # (almost) in line with the layer: not a T
+            continue
+        if bb is None or min(bb.Max.Z, info["z"][1]) - max(bb.Min.Z, info["z"][0]) < TOL_Z:
+            continue
+        normal = XYZ.BasisZ.CrossProduct(line.Direction)
+        cos    = out.DotProduct(normal)
+        if cos < 0:
+            normal, cos = normal.Negate(), -cos
+        gap = flat(line.GetEndPoint(0) - face).DotProduct(normal)           # from the old face to the centerline
+        if gap <= 0 or end_moved(gap - info["width"] / 2.0):                # that face is not a face of the layer
+            continue
+        dist  = gap / cos                                                   # the same, along the neighbor
+        along = flat(face + out.Multiply(dist) - line.GetEndPoint(0)).DotProduct(line.Direction)
+        if along < -TOL_END or along > line.Length + TOL_END:
+            continue
+        if found is not None and abs(found - dist) > TOL_END:               # layers of stacked members not aligned
+            return
+        found = dist
+    if found is not None:
+        set_end(wall, end, face + out.Multiply(found))
+
+
+def extend_to_reach(track, wall, end):
+    """Layer wall whose original went beyond its location end point (it ran through the corner up to the
+    far face of the other wall): its end point is moved there, so the wall that ended against it finds the
+    side of the layer - not its end - and is joined as a T."""
+    curve = wall.Location.Curve
+    origin, d = track["origin"], track["d"]
+    s = [(curve.GetEndPoint(i) - origin).DotProduct(d) for i in (0, 1)]
+    target = track["reach"][0 if s[end] < s[1 - end] else 1]
+    if abs(target - s[1 - end]) > abs(s[end] - s[1 - end]) + TOL_END:
+        set_end(wall, end, origin + d.Multiply(target) + track["n"].Multiply(track["c"]))
+
+
+def end_has_moved(key, item, cache):
+    """True if the end of the wall is not where it was before splitting (measured on its geometry)."""
+    wall, end = item["wall"], item["end"]
+    curve = wall.Location.Curve
+    track, nb = LAYER_ENDS.get(key[0]), NEIGHBORS.get(key)
+    if (track is None and nb is None) or not isinstance(curve, Line):
+        return not same_curve(curve, item["curve"])             # not measured: its location must not change
+
+    def segments(part):
+        pid = part.Id.ToString()
+        if pid not in cache:
+            cache[pid] = plan_segments(part)
+        return cache[pid]
+
+    if track is not None:
+        origin, d, n, c = track["origin"], track["d"], track["n"], track["c"]
+        if any(abs((curve.GetEndPoint(i) - origin).DotProduct(n) - c) > TOL_END for i in (0, 1)):
+            return True                                         # moved sideways
+        s    = [(curve.GetEndPoint(i) - origin).DotProduct(d) for i in (0, 1)]
+        side = 0 if s[end] < s[1 - end] else 1
+        r    = reach(segments(wall), origin, d, n, c)
+        if r is None:
+            return True
+        return end_moved(r[1] - track["reach"][1] if side == 1 else track["reach"][0] - r[0])
+
+    origin, d, n = nb["points"][0], nb["d"], nb["n"]
+    if any(abs((curve.GetEndPoint(i) - origin).DotProduct(n)) > TOL_END for i in (0, 1)):
+        return True                                             # moved sideways
+    if (key[0], 1 - end) not in NEIGHBORS and curve.GetEndPoint(1 - end).DistanceTo(nb["points"][1 - end]) > TOL_END:
+        return True                                             # its other end moved
+    for part, c, value in nb["lines"]:
+        r = reach(segments(part), origin, d, n, c)
+        if r is None or end_moved(r[1] - value if end == 1 else value - r[0]):
+            return True
+    return False
+
+
+def pin_end(key, item):
+    """Leaves the end of the wall unjoined, exactly where it was before splitting: without a join the wall
+    ends (square) at the end point of its location curve, which is moved to where the wall really ended."""
+    wall, end = item["wall"], item["end"]
+    WallUtils.DisallowWallJoinAtEnd(wall, end)
+    curve = wall.Location.Curve
+    track, nb = LAYER_ENDS.get(key[0]), NEIGHBORS.get(key)
+    if (track is None and nb is None) or not isinstance(curve, Line):
+        if not same_curve(curve, item["curve"]):
+            wall.Location.Curve = item["curve"]
+        return
+
+    if track is not None:
+        origin, d, offset = track["origin"], track["d"], track["n"].Multiply(track["c"])
+        s      = [(curve.GetEndPoint(i) - origin).DotProduct(d) for i in (0, 1)]
+        s[end] = track["reach"][0 if s[end] < s[1 - end] else 1]
+        set_line(wall, [origin + d.Multiply(v) + offset for v in s])
+        return
+
+    origin, d, n = nb["points"][0], nb["d"], nb["n"]
+    if nb["stacked"]:
+        # A stacked wall has one location line, but its members may have ended at different places (each
+        # one joined in its own way): every member is left where it was. Revit rebuilds the members from
+        # the stacked wall whenever it changes, so the stacked wall goes first (back on its original line),
+        # and the ends of its members pinned before are set again
+        nb["pinned"] = True
+        set_line(wall, nb["points"])
+        doc.Regenerate()
+        for pinned in [NEIGHBORS.get((key[0], e)) for e in (0, 1)]:
+            if pinned is None or not pinned.get("pinned"):
+                continue
+            for part, c, value in pinned["lines"]:
+                part_curve = part.Location.Curve
+                part_end   = near_end(part_curve, pinned["points"][pinned["end"]])
+                WallUtils.DisallowWallJoinAtEnd(part, part_end)
+                s = [(part_curve.GetEndPoint(i) - origin).DotProduct(d) for i in (0, 1)]
+                s[part_end] = value
+                set_line(part, [origin + d.Multiply(v) + n.Multiply(c) for v in s])
+        return
+    s      = [(curve.GetEndPoint(i) - origin).DotProduct(d) for i in (0, 1)]    # on its original axis
+    s[end] = nb["lines"][0][2]                                                  # where its centerline ended
+    set_line(wall, [origin + d.Multiply(v) for v in s])
+
+
+# Wall ends still to be checked: {(wall id, end): {"wall", "end", "curve", "restore"}}
+PENDING = {}
+
+def restore_joins():
+    """Allows again the joins disallowed while splitting (except the ends cleaned up by fix_corners) and
+    checks, on the real geometry, that every wall still ends where it ended before splitting.
+    Joining moves the end point of a wall onto the location line of the wall it is joined to: that is fine
+    as long as the wall itself (its faces, its real end) stays in place. The ends Revit cannot join without
+    moving the wall are left unjoined, exactly where they were. Returns the ends left unjoined."""
+    def add(wall, end, restore):
+        if not wall.IsValidObject:                  # created in a rolled back transaction, or deleted
+            return
+        key = (wall.Id.ToString(), end)
+        if key not in PENDING and key not in CLEANED:
+            PENDING[key] = {"wall": wall, "end": end, "curve": wall.Location.Curve.Clone(), "restore": restore}
+
+    for wall, ends in FREED.values():
+        for end in ends:
+            add(wall, end, True)
+    FREED.clear()
+    # Checked as well, although their join is not restored (it was already disallowed, or it is not a
+    # join with a split wall): they must end where they ended too
+    for nb in NEIGHBORS.values():
+        add(nb["wall"], nb["end"], False)
+    for track in LAYER_ENDS.values():
+        for end in (0, 1):
+            add(track["wall"], end, False)
+
+    layers = [layer_info(t["wall"]) for t in LAYER_ENDS.values()
+              if t["wall"].IsValidObject and isinstance(t["wall"].Location.Curve, Line)]
+    for key in sorted(PENDING):
+        item = PENDING[key]
+        if not item["restore"] or not isinstance(item["wall"].Location.Curve, Line):
+            continue
+        if key in NEIGHBORS and NEIGHBORS[key]["slide"]:
+            slide_to_layer(NEIGHBORS[key], layers)
+        elif key[0] in LAYER_ENDS:
+            extend_to_reach(LAYER_ENDS[key[0]], item["wall"], item["end"])
+    for item in PENDING.values():
+        if item["restore"] and not WallUtils.IsWallJoinAllowedAtEnd(item["wall"], item["end"]):
+            WallUtils.AllowWallJoinAtEnd(item["wall"], item["end"])
     doc.Regenerate()
+    return check_ends()
+
+
+def check_ends():
+    """Leaves unjoined, where they were, the wall ends (PENDING) that are not where they were before
+    splitting. Unjoining an end can change the walls that were joined to it: they are checked again until
+    nothing moves. Returns the ends left unjoined (that were joined)."""
     unjoined = 0
-    for wall, ends, curve in moved:
-        if not same_curve(wall.Location.Curve, curve):
-            for end in ends:
-                WallUtils.DisallowWallJoinAtEnd(wall, end)
+    for _ in range(6):
+        cache = {}
+        for key in list(PENDING):
+            if not PENDING[key]["wall"].IsValidObject:
+                PENDING.pop(key)
+        moved = [key for key in sorted(PENDING) if end_has_moved(key, PENDING[key], cache)]
+        if not moved:
+            break
+        for key in moved:
+            item = PENDING.pop(key)
+            if item["restore"] or WallUtils.IsWallJoinAllowedAtEnd(item["wall"], item["end"]):
                 unjoined += 1
-            wall.Location.Curve = curve
+            pin_end(key, item)
+        doc.Regenerate()
     return unjoined
 
 
@@ -437,7 +837,7 @@ def place_layer_wall(src_wall, layer_type, target, normal, layer_idx, all_target
         if new_wall is None:
             raise Exception("The wall could not be copied")
     new_wall.Pinned = False
-    free_ends(new_wall)                     # moving it must not drag the walls joined to it
+    free_ends(new_wall, None if reuse else src_wall)    # moving it must not drag the walls joined to it
 
     # Non-opening hosted elements: only in the nearest layer (before moving the wall)
     for fi in hosted_instances(new_wall):
@@ -465,8 +865,9 @@ def can_rebuild(wall):
     return True
 
 
-def basic_member(wall):
-    """Data of a basic wall in the format of a stacked member (see stacked_members)."""
+def basic_member(wall, curve):
+    """Data of a basic wall in the format of a stacked member (see stacked_members).
+    curve: clone of its location curve (it is used after other walls are created and regenerated)."""
     doors, holes = [], []
     for eid in wall.FindInserts(True, False, False, False):
         e = doc.GetElement(eid)
@@ -474,16 +875,16 @@ def basic_member(wall):
             holes.append(e)
         elif isinstance(e, FamilyInstance) and is_opening(e):
             doors.append(e)
-    curve = wall.Location.Curve
     rects = [opening_rect(op, curve) for op in holes if op.IsRectBoundary]
     return {"wall": wall, "curve": curve, "normal": wall.Orientation, "rel_bottom": 0.0,
             "height": wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble(),
             "is_top": True, "doors": doors, "holes": rects, "lost": len(holes) - len(rects)}
 
 
-def split_basic_wall(wall):
+def split_basic_wall(wall, footprint):
     """Splits a basic wall. The original wall becomes one of the layers (the one closest to its fixtures,
-    else the structural one). Returns (layer walls, openings, warnings)."""
+    else the structural one). footprint: plan_segments of the wall, measured before any wall was modified.
+    Returns (layer walls, openings, warnings)."""
     cs = wall.WallType.GetCompoundStructure()
     if cs is None:
         raise Exception("Wall type without compound structure")
@@ -491,12 +892,15 @@ def split_basic_wall(wall):
     if len(layers) < 2:
         return [], 0, []
 
-    curve, normal = wall.Location.Curve, wall.Orientation
+    # Clone: the curve returned by Location.Curve points to the geometry of the wall, and it is not valid
+    # anymore (Revit crashes when it is read) once the wall changes its type or is moved
+    curve, normal = wall.Location.Curve.Clone(), wall.Orientation
     # Measured on the real exterior face: the location curve is not always where the Location Line says
     ext = ext_face_from_geometry(wall, curve, normal)
     if ext is None:
         ext = ext_face_from_key_ref(wall, cs)
-    targets = [offset_curve(curve, ext - acc - layer.Width / 2.0, normal) for layer, acc in layers]
+    offsets = [ext - acc - layer.Width / 2.0 for layer, acc in layers]      # layer centerlines
+    targets = [offset_curve(curve, offset, normal) for offset in offsets]
     pieces  = [(get_layer_type(wall.WallType, layer), layer.Function == MaterialFunctionAssignment.Structure)
                for layer, _ in layers]
 
@@ -509,7 +913,7 @@ def split_basic_wall(wall):
     else:
         keep = structural[0] if structural else 0
     rebuild = can_rebuild(wall)
-    member  = basic_member(wall)
+    member  = basic_member(wall, curve)
 
     if wall.Pinned:
         wall.Pinned = False
@@ -527,6 +931,8 @@ def split_basic_wall(wall):
     # The original wall last: the copies above are made from it unchanged
     walls[keep] = place_layer_wall(wall, pieces[keep][0], targets[keep], normal, keep, targets, pieces[keep][1],
                                    reuse=True)
+    for layer_wall, offset in zip(walls, offsets):
+        track_layer(layer_wall, footprint, curve, normal, offset)
 
     warnings = []
     if failed or member["lost"]:
@@ -580,8 +986,10 @@ def opening_rect(opening, curve):
 
 
 
-def stacked_members(wall):
-    """Data of each member of the stacked wall (bottom -> top), measured on the original."""
+def stacked_members(wall, curves):
+    """Data of each member of the stacked wall (bottom -> top), measured on the original.
+    curves: {member id: location curve} measured before any wall was modified (the ends of the location
+    curve of a member depend on its joins, and they may have been disallowed by now)."""
     members = []
     for mid in wall.GetStackedWallMemberIds():
         member = doc.GetElement(mid)
@@ -608,7 +1016,7 @@ def stacked_members(wall):
     for i, (zmin, zmax, member) in enumerate(members):
         is_top = i == len(members) - 1
         top_z  = zmax if is_top else members[i + 1][0]
-        curve  = member.Location.Curve
+        curve  = curves.get(member.Id.ToString()) or member.Location.Curve.Clone()
         cs     = member.WallType.GetCompoundStructure()
         ext    = ext_face_from_geometry(member, curve, member.Orientation)
         if ext is None:
@@ -754,7 +1162,7 @@ def create_layer_wall(stacked, member, layer_type, target, structural):
     if in_place and XYZ.BasisZ.CrossProduct(curve.Direction).DotProduct(member["normal"]) < 0:
         curve = curve.CreateReversed()
     new_wall = Wall.Create(doc, curve, layer_type.Id, base_level, member["height"], base_off, False, structural)
-    free_ends(new_wall)                     # later moves of other walls must not drag it (and vice versa)
+    free_ends(new_wall, stacked, curve)     # later moves of other walls must not drag it (and vice versa)
 
     if member["is_top"]:
         if top_level != ElementId.InvalidElementId:
@@ -778,36 +1186,39 @@ def create_layer_wall(stacked, member, layer_type, target, structural):
     return new_wall
 
 
-def split_stacked_wall(wall):
+def split_stacked_wall(wall, footprint, curves):
     """Rebuilds a stacked wall as basic walls (one per layer > 5 cm of each member).
-    Returns (walls created, doors/windows + openings created, warnings)."""
+    footprint: {member id: plan_segments}, curves: {member id: location curve}, both measured before any
+    wall was modified. Returns (walls created, doors/windows + openings created, warnings)."""
     stacked_structural = wall.get_Parameter(BuiltInParameter.WALL_STRUCTURAL_SIGNIFICANT)
     stacked_structural = bool(stacked_structural and stacked_structural.AsInteger())
 
     # 1- Measure everything on the original (before modifying anything)
     pieces, warnings, lost = [], [], 0
-    for member in stacked_members(wall):
+    for member in stacked_members(wall, curves):
         lost  += member["lost"]
         layers = get_layers(member["cs"], MIN_LAYER)
         for layer, acc in layers:
-            b      = member["ext"] - acc                   # exterior side of the layer
-            target = offset_curve(member["curve"], b - layer.Width / 2.0, member["normal"])
+            offset = member["ext"] - acc - layer.Width / 2.0   # layer centerline
+            target = offset_curve(member["curve"], offset, member["normal"])
             if member["cs"].LayerCount == 1:
                 layer_type = member["type"]                 # single-layer member keeps its own type
             else:
                 layer_type = get_layer_type(member["type"], layer)
             structural = stacked_structural and layer.Function == MaterialFunctionAssignment.Structure
-            pieces.append((member, layer_type, target, structural, member["holes"]))
+            pieces.append((member, layer_type, target, structural, member["holes"], offset))
 
     if not pieces:
         return [], 0, warnings
 
     # 2- Create the new walls, then their doors / windows and wall openings
     walls, jobs = [], []
-    for member, layer_type, target, structural, holes in pieces:
+    for member, layer_type, target, structural, holes, offset in pieces:
         new_wall = create_layer_wall(wall, member, layer_type, target, structural)
         walls.append(new_wall)
         jobs.append((new_wall, member["doors"], holes, member["curve"]))
+        track_layer(new_wall, footprint.get(member["wall"].Id.ToString()), member["curve"], member["normal"],
+                    offset)
     created_openings, failed = add_openings(jobs)
     if failed or lost:
         warnings.append("{} doors/windows/openings could not be created".format(failed + lost))
@@ -860,7 +1271,7 @@ def layer_info(wall):
     cs = wall.WallType.GetCompoundStructure()
     structure = cs is not None and cs.LayerCount == 1 and \
         cs.GetLayers()[0].Function == MaterialFunctionAssignment.Structure
-    return {"wall": wall, "line": wall.Location.Curve, "width": wall.Width, "z": (bb.Min.Z, bb.Max.Z),
+    return {"wall": wall, "line": wall.Location.Curve.Clone(), "width": wall.Width, "z": (bb.Min.Z, bb.Max.Z),
             "structure": structure}
 
 
@@ -997,6 +1408,7 @@ def fix_corners(sources):
     for weight, point, wall, end in proposals.values():
         WallUtils.DisallowWallJoinAtEnd(wall, end)
         FREED.get(wall.Id.ToString(), (None, set()))[1].discard(end)     # stays disallowed (clean corner)
+        CLEANED.add((wall.Id.ToString(), end))
         line  = wall.Location.Curve
         other = line.GetEndPoint(1 - end)
         point = XYZ(point.X, point.Y, line.GetEndPoint(end).Z)
@@ -1017,14 +1429,26 @@ if not walls:
 for wt in FilteredElementCollector(doc).OfClass(WallType):
     TYPES[get_name(wt)] = wt
 
-# Ends and joins of every wall, measured before any of them is split
+# Ends, joins and real footprint of every wall - and of the walls joined to them - measured before any
+# of them is split: splitting a wall changes the joins (and so the geometry) of its neighbors
+selected = set()
+for wall in walls:
+    selected.add(wall.Id.ToString())
+    if wall.IsStackedWall:
+        selected.update(i.ToString() for i in wall.GetStackedWallMemberIds())
+
 sources = {}
 for wall in walls:
     try:
+        members = [doc.GetElement(i) for i in wall.GetStackedWallMemberIds()] if wall.IsStackedWall else []
         sources[wall.Id.ToString()] = {"curve": wall.Location.Curve.Clone(), "width": wall_width(wall),
-                                       "ends": end_neighbors(wall), "layers": []}
+                                       "ends": end_neighbors(wall), "layers": [],
+                                       "footprint": footprints(wall),
+                                       "curves": dict((m.Id.ToString(), m.Location.Curve.Clone()) for m in members)}
+        track_neighbors(wall, selected)
     except Exception:
-        pass
+        print(traceback.format_exc())
+SEGMENTS.clear()
 
 report = []         # [wall id, type, result]
 created_total = 0
@@ -1054,11 +1478,13 @@ with forms.ProgressBar(title="Splitting walls... ({value} of {max_value})", canc
         t.Start()
         try:
             source_id = wall.Id.ToString()
+            source    = sources.get(source_id, {})
+            footprint = source.get("footprint", {})
             free_neighbor_ends(wall)            # walls joined to it must not follow it
             if wall.IsStackedWall:
-                layer_walls, openings, warnings = split_stacked_wall(wall)
+                layer_walls, openings, warnings = split_stacked_wall(wall, footprint, source.get("curves", {}))
             else:
-                layer_walls, openings, warnings = split_basic_wall(wall)
+                layer_walls, openings, warnings = split_basic_wall(wall, footprint.get(source_id))
             if not layer_walls:
                 t.RollBack()
                 report.append([wall_id, type_name, "Skipped: only one layer"])
@@ -1097,22 +1523,30 @@ if created_total:
         corners = "ERROR: {}".format(ex)
         print(traceback.format_exc())
 
-# Joins disallowed while splitting (so no other wall was dragged) are allowed again
+# Joins disallowed while splitting (so no other wall was dragged) are allowed again, and every wall end
+# is checked. Revit joins walls again when a transaction is committed: the ends are checked once more,
+# in a new transaction, until a check finds everything in place
 unjoined = 0
-if FREED:
-    t = Transaction(doc, "Split Walls - Joins")
-    options = t.GetFailureHandlingOptions()
-    options.SetFailuresPreprocessor(SilentFailures())
-    options.SetClearAfterRollback(True)
-    t.SetFailureHandlingOptions(options)
-    t.Start()
-    try:
-        unjoined = restore_joins()
-        t.Commit()
-    except Exception:
-        if t.HasStarted() and not t.HasEnded():
-            t.RollBack()
-        print(traceback.format_exc())
+if created_total:
+    for attempt in range(5):
+        t = Transaction(doc, "Split Walls - Joins")
+        options = t.GetFailureHandlingOptions()
+        options.SetFailuresPreprocessor(SilentFailures())
+        options.SetClearAfterRollback(True)
+        t.SetFailureHandlingOptions(options)
+        t.Start()
+        try:
+            changed = restore_joins() if attempt == 0 else check_ends()
+            if attempt and not changed:
+                t.RollBack()                    # nothing moved: nothing was modified
+                break
+            unjoined += changed
+            t.Commit()
+        except Exception:
+            if t.HasStarted() and not t.HasEnded():
+                t.RollBack()
+            print(traceback.format_exc())
+            break
 
 if created_total:
     tg.Assimilate()
@@ -1123,6 +1557,6 @@ output.print_md("## Split Walls")
 output.print_md("**{}** walls processed, **{}** layer walls, corners: **{}**.".format(len(report), created_total,
                                                                                      corners))
 if unjoined:
-    output.print_md("**{}** wall ends were left unjoined: joining them would have moved the walls.".format(
-        unjoined))
+    output.print_md("**{}** wall ends were left unjoined, exactly where they were: Revit could not join them "
+                    "without moving the walls.".format(unjoined))
 output.print_table(report, columns=["Wall", "Type", "Result"])
