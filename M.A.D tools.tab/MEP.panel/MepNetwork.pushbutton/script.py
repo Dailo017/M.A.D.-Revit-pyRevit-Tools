@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 __title__   = "MEP\nNetwork"
-__doc__     = """Version = 2.0
-Date    = 20.10.2026
+__doc__     = """Version = 2.1
+Date    = 16.11.2026
 ________________________________________________________________
 Description:
 
@@ -14,9 +14,10 @@ Creates networks of ducts and/or pipes from the layers of a DWG:
    the DWG (inner contour, rounded to the closest size of the
    type), single lines use the size of the form. Reductions are
    added where the width changes.
-4- Ends are extended / trimmed so that the network connects
-   (elbow = 2, tee = 3, cross = 4), arcs of the DWG are replaced
-   by elbows.
+4- Elbows drawn with arcs (inner + outer edge) are followed:
+   S bends, offsets and collars become ducts with elbows. The
+   other ends are extended / trimmed so that the network connects
+   (elbow = 2, tee = 3, cross = 4).
 5- The placeholders are converted into real ducts / pipes.
 6- The system types used are set to 'Performance': no network
    calculation is run by Revit.
@@ -29,6 +30,10 @@ How-To:
    the middle elevation from the level (mm).
 ________________________________________________________________
 Last Updates:
+- [16.11.2026] v2.1 Elbows drawn with arcs are followed (S bends,
+                    offsets, collars) + reductions and tees are
+                    preferred to far elbows + wide ducts with one
+                    continuous edge + faster reading of the DWG
 - [20.10.2026] v2.0 Network created from the layers of a DWG
                     + center line of double lines + height and
                     dimensions per layer
@@ -93,6 +98,9 @@ FLANGE_ZONE  = 1.0       # ~30 cm, gap a branch may cross to reach its main (fla
 MIN_LENGTH_FACTOR = 1.2  # double lines: a duct is at least this x its width long (corners: edge + axis)
 MIN_SINGLE_WITH_DRAWN = 10.0  # ~3 m, shorter single lines are dropped when there are double lines
 MERGE_GAP_MAX = 1.0      # ~30 cm, max gap between 2 collinear lines joined (dashed lines, flanges)
+FLANGE_OVERHANG = 0.25   # ~7.5 cm, how far a flange / end cap is drawn past the edges of its duct
+ARC_CENTER_TOL = 0.05    # ~1.5 cm, arcs around the same center draw one elbow
+MAX_ELBOW_ANGLE = 2.4    # rad (~135°), arcs turning more are not an elbow
 
 NONE_LABEL = '-- Nothing --'
 
@@ -173,7 +181,8 @@ def from_frame(d, off, t0, t1):
 def drop_symbols(segs):
     """Removes the closed rectangles that are not long (grille boxes, ducts seen
     in section, equipment...), even if other lines touch them: they are symbols,
-    not part of the network. Long closed rectangles are pieces of duct: kept."""
+    not part of the network. Long closed rectangles are pieces of duct: kept.
+    -> (segments, boxes of the symbols [(x0, y0, x1, y1), ...])"""
     nodes = {}
     for i, s in enumerate(segs):
         k0, k1 = point_key(s[0]), point_key(s[1])
@@ -199,16 +208,20 @@ def drop_symbols(segs):
                         drop.update((i, j, k, l))
 
     # What is drawn inside a symbol (grille sign...) goes with it
-    boxes = []
+    boxes = set()
     for i in drop:
         for j in drop:
             if j > i and point_key(segs[i][0]) in (point_key(segs[j][0]), point_key(segs[j][1])):
                 pts = list(segs[i]) + list(segs[j])
-                boxes.append((min(p[0] for p in pts), min(p[1] for p in pts),
-                              max(p[0] for p in pts), max(p[1] for p in pts)))
-    inside = lambda p, b: b[0] - OFF_TOL <= p[0] <= b[2] + OFF_TOL and b[1] - OFF_TOL <= p[1] <= b[3] + OFF_TOL
+                boxes.add((min(p[0] for p in pts), min(p[1] for p in pts),
+                           max(p[0] for p in pts), max(p[1] for p in pts)))
+    boxes = sorted(boxes)
     return [s for i, s in enumerate(segs)
-            if i not in drop and not any(inside(s[0], b) and inside(s[1], b) for b in boxes)]
+            if i not in drop and not any(in_box(s[0], b) and in_box(s[1], b) for b in boxes)], boxes
+
+
+def in_box(p, box, tol=OFF_TOL):
+    return box[0] - tol <= p[0] <= box[2] + tol and box[1] - tol <= p[1] <= box[3] + tol
 
 
 def merge_collinear(segs, gap):
@@ -242,24 +255,52 @@ def merge_collinear(segs, gap):
 
 
 
-def same_duct(a, b, max_width, pair_width):
+def cross_lines(d, segs):
+    """Lines perpendicular to the direction d (flanges, end caps), in its frame:
+    [(t, offset of one end, offset of the other end), ...] sorted by t."""
+    n = (-d[1], d[0])
+    out = []
+    for s in segs:
+        v = sub(s[1], s[0])
+        if abs(dot(v, d)) < math.sin(KINK_TOL) * math.hypot(v[0], v[1]):
+            lo, hi = sorted((dot(s[0], n), dot(s[1], n)))
+            out.append(((dot(s[0], d) + dot(s[1], d)) / 2.0, lo, hi))
+    out.sort()
+    return out
+
+
+def same_duct(a, b, max_width, pair_width, crossing=()):
     """a, b = (offset, t0, t1) of two parallel lines, b[0] >= a[0].
-    Close lines that overlap, or lines a bit further whose ends are aligned
-    (the edges of a duct drawn wider than the size chosen)."""
+    Close lines that overlap. Lines further apart than the size of the form allows
+    need a proof that they are the 2 edges of one wide duct and not 2 lines that
+    happen to run side by side (2 branches of a network drawn with single lines):
+    - both ends roughly aligned (a mitred piece shifts them by up to its width)
+    - or a line drawn across from one to the other and ending on them: a flange,
+      an end cap (the line 2 branches leave from goes on past them)."""
     gap = b[0] - a[0]
-    overlap = min(a[2], b[2]) - max(a[1], b[1])
+    lo, hi = max(a[1], b[1]), min(a[2], b[2])       # where they run side by side
     if gap <= max_width:
-        return overlap > 0.3 * min(a[2] - a[1], b[2] - b[1])
-    return (gap <= pair_width and overlap > 0
-            and abs(a[1] - b[1]) <= gap + OFF_TOL and abs(a[2] - b[2]) <= gap + OFF_TOL)
+        return hi - lo > 0.3 * min(a[2] - a[1], b[2] - b[1])
+    if gap > pair_width or hi <= lo:
+        return False
+    if abs(a[1] - b[1]) <= gap + OFF_TOL and abs(a[2] - b[2]) <= gap + OFF_TOL:
+        return True
+    for t, start, end in crossing:
+        if t > hi + EDGE_TOL:
+            break
+        if (t >= lo - EDGE_TOL and abs(start - a[0]) <= FLANGE_OVERHANG and abs(end - b[0]) <= FLANGE_OVERHANG):
+            return True
+    return False
 
 
-def center_lines(segs, max_width, pair_width):
+def center_lines(segs, max_width, pair_width, elbows=()):
     """Replaces the parallel lines of one duct / pipe by their center line.
-    Lines without a parallel partner are kept, except short ones (end caps)."""
-    bands, singles = [], []
+    Lines without a parallel partner are kept, except short ones (end caps).
+    elbows: the ones drawn with arcs, their flanges are not ducts either."""
+    bands, singles, shorts = [], [], []
     for d, group in parallel_groups(segs):
         rows = sorted(to_frame(d, s) for s in group)
+        crossing = cross_lines(d, segs)
 
         # Union-find of close parallel lines that overlap
         parent = list(range(len(rows)))
@@ -272,7 +313,8 @@ def center_lines(segs, max_width, pair_width):
             for j in range(i + 1, len(rows)):
                 if rows[j][0] - rows[i][0] > pair_width:
                     break
-                if same_duct(rows[i], rows[j], max_width, pair_width):
+                # collinear: 2 pieces of one edge (cut by a branch, a symbol...)
+                if rows[j][0] - rows[i][0] <= OFF_TOL or same_duct(rows[i], rows[j], max_width, pair_width, crossing):
                     parent[root(j)] = root(i)
 
         components = {}
@@ -294,10 +336,14 @@ def center_lines(segs, max_width, pair_width):
             for off, t0, t1, w in merge_pieces(pieces):
                 if w is None:
                     singles.append(from_frame(d, off, t0, t1))
-                elif MIN_LENGTH_FACTOR * w <= t1 - t0:  # shorter -> flange, equipment...
+                elif MIN_LENGTH_FACTOR * w <= t1 - t0:
                     bands.append((from_frame(d, off, t0, t1), w))
+                else:                                   # flange, equipment... or a collar
+                    shorts.append((from_frame(d, off, t0, t1), w))
 
-    bands = [b for b in bands if not is_flange(b, bands) and not is_overlapped(b, bands)]
+    legs = [((corner, p), w) for w, corner, ends in elbows for p, _ in ends]
+    bands = [b for b in bands if not is_flange(b, bands + legs) and not is_overlapped(b, bands)]
+    bands += [b for b in shorts if is_collar(b, elbows)]
 
     # Drawn mostly with double lines -> the single lines are end caps, flanges...;
     # otherwise only the short ones are dropped
@@ -322,6 +368,21 @@ def is_flange(band, bands):
         t, off = param_on(other, mid)
         if off <= wo / 4.0 and -2 * wo <= t <= seg_len(other) + 2 * wo:
             return True
+    return False
+
+
+def is_collar(band, elbows):
+    """A short piece of duct drawn right after an elbow: on the axis of one of
+    its ends and of its width (the other short pieces are flanges, equipment...)."""
+    seg, w = band
+    d = unit(sub(seg[1], seg[0]))
+    for we, _, ends in elbows:
+        if abs(w - we) > EDGE_TOL:
+            continue
+        for p, t in ends:
+            if abs(cross(d, t)) < math.sin(KINK_TOL) and abs(cross(t, sub(seg[0], p))) <= ECCENTRIC_TOL:
+                if -we / 2.0 <= min(dot(sub(q, p), t) for q in seg) <= we:
+                    return True
     return False
 
 
@@ -556,14 +617,158 @@ def free_ends(segs):
     return free
 
 
-def snap_ends(segs, limits, widths, max_behind):
+def arc_circle(a, b, c):
+    """(center, radius) of the circle through 3 points (None if they are aligned)."""
+    d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]))
+    if abs(d) < 1e-9:
+        return None
+    sa, sb, sc = dot(a, a), dot(b, b), dot(c, c)
+    center = ((sa * (b[1] - c[1]) + sb * (c[1] - a[1]) + sc * (a[1] - b[1])) / d,
+              (sa * (c[0] - b[0]) + sb * (a[0] - c[0]) + sc * (b[0] - a[0])) / d)
+    return center, dist(center, a)
+
+
+def arc_elbows(arcs, max_width):
+    """Elbows drawn in the DWG: arcs around the same center with the same ends
+    (inner edge, outer edge, sometimes the axis). arcs: [(start, middle, end), ...]
+    -> [(width, corner, [(end point, direction), (end point, direction)]), ...]
+    end point: where the axis of the elbow ends, direction: away from the elbow.
+    corner: where the 2 axes meet (the elbow of Revit goes there)."""
+    groups, cells = [], {}
+    for arc in arcs:
+        found = arc_circle(*arc)
+        if not found:
+            continue
+        center, radius = found
+        u0, u1 = unit(sub(arc[0], center)), unit(sub(arc[2], center))
+        if dot(sub(arc[1], center), add(u0, u1)) <= 0:      # half a circle or more
+            continue
+        cx, cy = int(round(center[0] / ARC_CENTER_TOL)), int(round(center[1] / ARC_CENTER_TOL))
+        group = None
+        for g in (g for dx in (-1, 0, 1) for dy in (-1, 0, 1) for g in cells.get((cx + dx, cy + dy), ())):
+            same_ends = min(max(dot(u0, g[1]), dot(u0, g[2])), max(dot(u1, g[1]), dot(u1, g[2]))) > math.cos(KINK_TOL)
+            if dist(center, g[0]) <= ARC_CENTER_TOL and same_ends:
+                group = g
+                break
+        if group is None:
+            group = [center, u0, u1, []]
+            groups.append(group)
+            cells.setdefault((cx, cy), []).append(group)
+        group[3].append(radius)
+
+    elbows = []
+    for center, u0, u1, radii in groups:
+        width, radius = max(radii) - min(radii), (max(radii) + min(radii)) / 2.0
+        angle = math.acos(max(-1.0, min(1.0, dot(u0, u1))))
+        if not (EDGE_TOL < width <= max_width and KINK_TOL < angle <= MAX_ELBOW_ANGLE):
+            continue
+        corner = add(center, mul(unit(add(u0, u1)), radius / math.cos(angle / 2.0)))
+        ends = [add(center, mul(u, radius)) for u in (u0, u1)]
+        elbows.append((width, corner, [(p, unit(sub(p, corner))) for p in ends]))
+    return elbows
+
+
+def connect_elbows(segs, widths, limits, elbows):
+    """The elbows drawn in the DWG say which ducts they join: the duct ending in
+    front of each end of an elbow is extended to its corner. Two elbows back to
+    back (S bend, offset) get a new piece between their corners, an end with no
+    duct in front (reduction, riser) gets a stub.
+    -> (segments, widths, limits, new pieces [(segment, width), ...])"""
+    if not elbows:
+        return segs, widths, limits, []
+    old = [tuple(s) for s in segs]
+    segs, widths, limits = [list(s) for s in segs], list(widths), list(limits)
+    ports = [(k, p, t, w) for k, (w, _, ends) in enumerate(elbows) for p, t in ends]    # ports 2k, 2k + 1
+    index = SegIndex(old, SNAP_DRAWN * max(w for w, _, _ in elbows))
+
+    def in_front(p, t, w, q, facing):
+        """q is on the axis leaving the port (p, t), not too far, and looks at it."""
+        v = sub(q, p)
+        return (dot(facing, t) < -math.cos(KINK_TOL) and abs(cross(t, v)) <= ECCENTRIC_TOL
+                and -w <= dot(v, t) <= SNAP_DRAWN * w)
+
+    links = []
+    for a, (ka, p, t, w) in enumerate(ports):
+        for i in index.near(p):
+            if seg_len(old[i]) <= POINT_TOL:
+                continue
+            for e in (0, 1):
+                if in_front(p, t, w, old[i][e], unit(sub(old[i][e], old[i][1 - e]))):
+                    links.append((abs(dot(sub(old[i][e], p), t)), a, ('end', i, e)))
+        for b in range(a + 1, len(ports)):
+            kb, q, tq, _ = ports[b]
+            if kb != ka and in_front(p, t, w, q, tq):
+                links.append((abs(dot(sub(q, p), t)), a, ('port', b)))
+
+    # closest first, each port and each end of a duct is used once
+    linked, taken = {}, set()
+    for _, a, target in sorted(links):
+        if a in linked or target in taken or (target[0] == 'port' and target[1] in linked):
+            continue
+        linked[a] = target
+        taken.add(target)
+        if target[0] == 'port':
+            linked[target[1]] = ('port', a)
+
+    def axis(a):
+        """Line the port follows: the duct it joins, else the one drawn by the arcs."""
+        _, p, t, _ = ports[a]
+        target = linked.get(a)
+        if target is None:
+            return p, t
+        if target[0] == 'end':
+            s = old[target[1]]
+            return s[0], unit(sub(s[1], s[0]))
+        return mul(add(p, ports[target[1]][1]), 0.5), ports[min(a, target[1])][2]    # same line for both
+
+    corners = []
+    for k, (_, corner, _) in enumerate(elbows):
+        (p0, d0), (p1, d1) = axis(2 * k), axis(2 * k + 1)
+        corners.append(line_intersection(p0, d0, p1, d1) or corner)
+
+    new = []
+    for a, (k, p, t, w) in enumerate(ports):
+        target, corner = linked.get(a), corners[k]
+        if target is None and (a ^ 1) not in linked:        # joins nothing: drawn for another layer
+            continue
+        piece, limit = None, SNAP_DRAWN * w
+        if target is None:
+            piece, limit = (corner, p), 0.0                 # stub: it ends where the elbow does
+        elif target[0] == 'port':
+            if a < target[1]:
+                piece = (corner, corners[ports[target[1]][0]])
+        else:
+            i, e = target[1], target[2]
+            other = segs[i][1 - e]
+            if seg_len((other, corner)) > MIN_SEG / 2 and dot(sub(corner, other), sub(old[i][e], other)) > 0:
+                segs[i][e] = corner
+            else:
+                piece, limit = (corner, p), 0.0
+        if piece and seg_len(piece) > POINT_TOL:
+            new.append((piece, w))
+            segs.append(list(piece))
+            widths.append(w)
+            limits.append(limit)
+    return [tuple(s) for s in segs], widths, limits, new
+
+
+def snap_ends(segs, limits, widths, boxes=()):
     """Extends / trims the free ends so that they meet:
     1- two free ends -> intersection of their lines (elbow, arcs of the DWG)
     2- a free end    -> onto another segment (tee)
-    limits[i]: how far the ends of segment i may move, widths[i]: its width
-    (a branch may also reach the axis of the main it ends on)."""
+    limits[i]: how far the ends of segment i may be extended, widths[i]: its width
+    (it may be trimmed by about half of it, and a branch may reach the axis of
+    the main it ends on). boxes: symbols (riser, grille...), a duct that ends on
+    one is not extended past it."""
     segs = [list(s) for s in segs]
     snap = max(limits) if limits else 0.0
+    behind = [stub_length(w) for w in widths]
+    ends_on = {}            # (segment, end) -> boxes of the symbols it ends on
+    for i, s in enumerate(segs):
+        for e in (0, 1):
+            found = [b for b in boxes if in_box(s[e], b, FLANGE_OVERHANG)]
+            if found:
+                ends_on[(i, e)] = found
 
     def outward(i, e):
         return unit(sub(segs[i][e], segs[i][1 - e]))
@@ -571,7 +776,9 @@ def snap_ends(segs, limits, widths, max_behind):
     def reach(i, e, pt, limit=None):
         """Signed distance from the end to pt along the segment (None if too far)."""
         a = dot(sub(pt, segs[i][e]), outward(i, e))
-        if -max_behind <= a <= (limit or limits[i]) and seg_len((segs[i][1 - e], pt)) > MIN_SEG / 2:
+        if a > OFF_TOL and not all(in_box(pt, b, FLANGE_OVERHANG) for b in ends_on.get((i, e), ())):
+            return None                                     # past the symbol it ends on
+        if -behind[i] <= a <= (limit or limits[i]) and seg_len((segs[i][1 - e], pt)) > MIN_SEG / 2:
             return a
         return None
 
@@ -611,7 +818,7 @@ def snap_ends(segs, limits, widths, max_behind):
         p = segs[f[0]][f[1]]
         grid.setdefault((int(p[0] // snap), int(p[1] // snap)), []).append(f)
 
-    candidates, off_axis = [], []
+    candidates = []         # (distance, end, end, point where they meet / None = eccentric reduction)
     for (i, e) in free:
         p = segs[i][e]
         cx, cy = int(p[0] // snap), int(p[1] // snap)
@@ -634,31 +841,31 @@ def snap_ends(segs, limits, widths, max_behind):
                             elif (abs(side - abs(widths[i] - widths[j]) / 2.0) <= ECCENTRIC_TOL
                                   and gap <= 2 * max(widths[i], widths[j])):
                                 # reduction with one flat side: axes offset by half the width difference
-                                off_axis.append((gap, (i, e), (j, f)))
+                                candidates.append((gap, (i, e), (j, f), None))
                         continue
                     if dot(outward(i, e), outward(j, f)) > FOLD_BACK_TOL:    # turn > 90°: not a duct
                         continue
                     a, b = reach(i, e, pt), reach(j, f, pt)
-                    if (a is not None and b is not None
-                            and not closer_tee((i, e), abs(a)) and not closer_tee((j, f), abs(b))):
-                        candidates.append((abs(a) + abs(b), (i, e), (j, f), pt))
-
-    used = set()
-    for _, end_a, end_b, pt in sorted(candidates):
-        if end_a in used or end_b in used or not (keeps_shape(end_a, pt) and keeps_shape(end_b, pt)):
-            continue
-        used.update((end_a, end_b))
-        segs[end_a[0]][end_a[1]] = pt
-        segs[end_b[0]][end_b[1]] = pt
+                    if a is None or b is None or closer_tee((i, e), abs(a)) or closer_tee((j, f), abs(b)):
+                        continue
+                    # one duct is drawn past the other, which can end on it: a tee
+                    if (a < -OFF_TOL and tee_first[(j, f)]) or (b < -OFF_TOL and tee_first[(i, e)]):
+                        continue
+                    candidates.append((abs(a) + abs(b), (i, e), (j, f), pt))
 
     # Facing pieces whose axes are a bit offset (reduction with one flat side):
     # the ends stay where they are, a reduction is tried between them later
-    eccentric = []
-    for _, end_a, end_b in sorted(off_axis):
+    used, eccentric = set(), []
+    for _, end_a, end_b, pt in sorted(candidates, key=lambda c: c[:3]):
         if end_a in used or end_b in used:
             continue
-        used.update((end_a, end_b))
-        eccentric.append((tuple(segs[end_a[0]][end_a[1]]), tuple(segs[end_b[0]][end_b[1]]), outward(*end_a)))
+        if pt is None:
+            used.update((end_a, end_b))
+            eccentric.append((tuple(segs[end_a[0]][end_a[1]]), tuple(segs[end_b[0]][end_b[1]]), outward(*end_a)))
+        elif keeps_shape(end_a, pt) and keeps_shape(end_b, pt):
+            used.update((end_a, end_b))
+            segs[end_a[0]][end_a[1]] = pt
+            segs[end_b[0]][end_b[1]] = pt
 
     # 2- Tees: remaining free ends onto the closest segment
     index = SegIndex(segs, snap)
@@ -696,14 +903,23 @@ def split_at_ends(segs):
     return out
 
 
-def drop_stubs(segs, max_len):
-    """Removes the short pieces with a free end (lines drawn past a corner)."""
-    counts = {}
+def stub_length(width):
+    """A line is drawn past a corner / trimmed back by up to about half the width of its duct."""
+    return (width * WIDTH_FACTOR + OFF_TOL) / 2.0
+
+
+def drop_stubs(segs, widths, width, keep=()):
+    """Removes the short pieces with a free end (lines drawn past a corner):
+    shorter than about half their own width (width: size of the form, for the
+    pieces without one). keep: ends that are not free, a reduction will be made there.
+    -> (segments, widths)"""
+    counts = dict((point_key(p), 2) for p in keep)
     for s in segs:
         for p in s:
             counts[point_key(p)] = counts.get(point_key(p), 0) + 1
-    return [s for s in segs
-            if seg_len(s) > max_len or all(counts[point_key(p)] > 1 for p in s)]
+    kept = [(s, w) for s, w in zip(segs, widths)
+            if seg_len(s) > stub_length(w if w is not None else width) or all(counts[point_key(p)] > 1 for p in s)]
+    return [s for s, _ in kept], [w for _, w in kept]
 
 
 def shift_reductions(segs, widths, width):
@@ -836,18 +1052,20 @@ def junctions(segs, widths):
                                    for kind, p, ids in pending]
 
 
-def build_network(segs, width, sizes=None, max_drawn=0.0):
+def build_network(segs, width, sizes=None, max_drawn=0.0, arcs=()):
     """DWG segments of one layer -> (center lines, widths, connections).
     width: size of the form, used for single lines. Double lines give their own
-    width (rounded to sizes), up to max_drawn."""
+    width (rounded to sizes), up to max_drawn. arcs: [(start, middle, end), ...],
+    the elbows they draw are followed."""
     max_width  = width * WIDTH_FACTOR + OFF_TOL
     gap        = width * PAIR_FACTOR + OFF_TOL
     pair_width = max(gap, max_drawn + OFF_TOL)
 
     segs = [s for s in segs if seg_len(s) > POINT_TOL]
-    segs = drop_symbols(segs)
+    segs, boxes = drop_symbols(segs)
     segs = merge_collinear(segs, min(gap, MERGE_GAP_MAX))
-    segs, measured = center_lines(segs, max_width, pair_width)
+    elbows = arc_elbows(arcs, pair_width)
+    segs, measured = center_lines(segs, max_width, pair_width, elbows)
 
     # Double lines: they can be short (stubs to terminals), their ends move
     # according to their own width. Single lines: the size of the form.
@@ -855,11 +1073,14 @@ def build_network(segs, width, sizes=None, max_drawn=0.0):
     segs = [s for s in segs if seg_len(s) >= (MIN_SEG if s in drawn else max(max_width, MIN_SEG))]
     widths = [drawn.get(s, width) for s in segs]
     limits = [SNAP_DRAWN * drawn[s] if s in drawn else max(width * SNAP_FACTOR, SNAP_MIN) for s in segs]
-    segs, eccentric = snap_ends(segs, limits, widths, max_width / 2.0)
+    # Elbows drawn in the DWG first, the other ends are then matched by distance
+    segs, widths, limits, pieces = connect_elbows(segs, widths, limits, elbows)
+    measured = measured + pieces
+    segs, eccentric = snap_ends(segs, limits, widths, boxes)
     segs = merge_collinear(segs, POINT_TOL)
     segs = split_at_ends(segs)
-    segs = drop_stubs(segs, max_width / 2.0)
     segs, widths = assign_widths(segs, measured, sizes)
+    segs, widths = drop_stubs(segs, widths, width, [p for pair in eccentric for p in pair[:2]])
     segs, widths = shift_reductions(segs, widths, width)
     segs, widths, joints = junctions(segs, widths)
     # the ends were straightened a bit: the eccentric reductions follow them
@@ -874,28 +1095,44 @@ def iter_curves(geometry):
         if isinstance(g, GeometryInstance):
             for c in iter_curves(g.GetInstanceGeometry()):
                 yield c
-        elif isinstance(g, (Line, PolyLine)):
+        elif isinstance(g, (Line, PolyLine, Arc)):
             yield g
 
 
 def read_layers(cad):
-    """{layer name: [((x0, y0), (x1, y1)), ...]} of the lines and polylines."""
+    """Lines, polylines and arcs of the DWG by layer:
+    -> ({layer name: [((x0, y0), (x1, y1)), ...]}, {layer name: [(start, middle, end), ...]})"""
     geometry = cad.get_Geometry(Options())
     if geometry is None:
         opt = Options()
         opt.View = doc.ActiveView
         geometry = cad.get_Geometry(opt)
 
-    layers = {}
+    names = {}          # graphics style -> layer name: one lookup per layer, not per curve
+    def layer_of(curve):
+        key = str(curve.GraphicsStyleId)
+        if key not in names:
+            style = doc.GetElement(curve.GraphicsStyleId)
+            category = style.GraphicsStyleCategory if style is not None else None
+            names[key] = category.Name if category is not None else None
+        return names[key]
+
+    xy = lambda p: (p.X, p.Y)
+    layers, arcs = {}, {}
     for c in iter_curves(geometry or []):
-        style = doc.GetElement(c.GraphicsStyleId)
-        if style is None or style.GraphicsStyleCategory is None:
+        name = layer_of(c)
+        if name is None:
+            continue
+        segs = layers.setdefault(name, [])
+        if isinstance(c, Arc):
+            if c.IsBound:                                   # not a full circle
+                arcs.setdefault(name, []).append((xy(c.GetEndPoint(0)), xy(c.Evaluate(0.5, True)),
+                                                  xy(c.GetEndPoint(1))))
             continue
         pts = [c.GetEndPoint(0), c.GetEndPoint(1)] if isinstance(c, Line) else list(c.GetCoordinates())
-        segs = layers.setdefault(style.GraphicsStyleCategory.Name, [])
         for a, b in zip(pts, pts[1:]):
-            segs.append(((a.X, a.Y), (b.X, b.Y)))
-    return layers
+            segs.append((xy(a), xy(b)))
+    return layers, arcs
 
 
 # ── Layer form ────────────────────────────────────
@@ -1407,7 +1644,7 @@ if not picked:
     script.exit()
 
 with forms.ProgressBar(title='Reading the DWG...', indeterminate=True):
-    layers = read_layers(cads[picked])
+    layers, arcs = read_layers(cads[picked])
 if not layers:
     forms.alert("The DWG has no lines.", exitscript=True)
 
@@ -1441,7 +1678,8 @@ with forms.ProgressBar(title="MEP Network - Center lines... {value}%", cancellab
         networks = []
         for s in settings:
             networks.append(build_network(sum((layers[n] for n in s['layers']), []), s['width'], s['size_list'],
-                                          MAX_DRAWN_WIDTH if s['kind'] == 'Ducts' else 0.0))
+                                          MAX_DRAWN_WIDTH if s['kind'] == 'Ducts' else 0.0,
+                                          sum((arcs.get(n, []) for n in s['layers']), [])))
             progress.advance()
 
         # 10-100 %: Revit (placeholders, connections, conversion, commit)
